@@ -154,10 +154,15 @@ Casper (root)
 │   ├── .click(path)                      → "File > Save As..."
 │   └── .items() → MenuItem[]
 │
-└── Permissions
-    ├── .check() → PermissionsStatus
-    ├── .accessibility → boolean
-    └── .screenRecording → boolean
+├── Permissions
+│   ├── .check() → PermissionsStatus
+│   ├── .accessibility → boolean
+│   └── .screenRecording → boolean
+│
+└── Script (AppleScript / OSA)
+    ├── .tell(app, command, opts?) → string  (static)
+    ├── .eval(source) → Record              (static)
+    └── .canScript(app) → boolean           (static)
 ```
 
 ## Design Principles
@@ -1537,6 +1542,7 @@ casper/
 | **File** | path string | (no Rust state) | TS-only |
 | **Finder** | Inherits from App | `HandleEntry::App` | No |
 | **Browser** | Inherits from App | `HandleEntry::App` | No |
+| **Script** | — | — | Yes |
 
 ---
 
@@ -1573,4 +1579,621 @@ casper/
 5. element.dispose()
    → casper_release(handle=4)
    → Rust: removes handle 4, drops AXUIElement
+```
+
+---
+
+## AppleScript as a Complementary Control Plane
+
+> Inspired by [spotify-cli-mac](https://github.com/ersel/spotify-cli-mac), which
+> uses AppleScript for all local playback control and the Spotify Web API for
+> search/discovery — choosing the fastest, most reliable mechanism per operation.
+
+### Why both AX and AppleScript?
+
+Accessibility APIs and AppleScript scripting dictionaries are **complementary,
+not competing**:
+
+| | Accessibility (AX) | AppleScript |
+|---|---|---|
+| **What it gives you** | UI structure — buttons, text fields, their positions | Semantic verbs — `play track`, `set volume`, `make new document` |
+| **Works on** | Every app with a GUI (even unsigned) | Only apps that ship a `.sdef` scripting dictionary |
+| **Reliability** | Depends on AX tree quality (Electron can be messy) | Very stable for apps that support it |
+| **Speed** | Must walk the element tree | Direct command dispatch, no tree walking |
+| **Best for** | UI discovery, clicking arbitrary elements, reading layout | App-specific actions, state queries, batch operations |
+
+Many macOS apps expose rich scripting dictionaries: Spotify, Music, Safari,
+Finder, Mail, Messages, Calendar, Reminders, Terminal, Keynote, Pages, Numbers,
+etc. For these apps, AppleScript gives **semantic actions** that are 10x more
+reliable than groping through AX elements.
+
+### The Script entity
+
+`Script` is a stateless entity (no handles) that executes AppleScript via the
+Rust layer, which calls `NSAppleScript` or `OSAScript`:
+
+```typescript
+export const Script = {
+  /**
+   * Execute a command inside `tell application "appName"`.
+   *
+   * @param appName - Application name (e.g. "Spotify", "Safari")
+   * @param command - AppleScript command(s) to run inside the tell block
+   * @param opts.launchIfNeeded - Launch the app first if not running (default: false)
+   * @returns The string result from AppleScript, or null if no return value
+   */
+  async tell(appName: string, command: string, opts?: { launchIfNeeded?: boolean }): Promise<string | null> {
+    // → casper_script_tell("Spotify", "play track \"spotify:track:xxx\"", launch)
+    // Rust: wraps in `tell application "Spotify" to <command>`, executes via NSAppleScript
+  },
+
+  /**
+   * Execute a full AppleScript source string. Returns the result parsed as
+   * a JSON-compatible record when possible.
+   */
+  async eval(source: string): Promise<Record<string, unknown> | string | null> {
+    // → casper_script_eval(source)
+    // Rust: NSAppleScript executeAndReturnError
+  },
+
+  /**
+   * Check whether an application has a scripting dictionary (.sdef).
+   */
+  async canScript(appName: string): Promise<boolean> {
+    // → casper_script_can_script("Spotify")
+    // Rust: check for .sdef in app bundle
+  },
+};
+```
+
+### Rust FFI surface
+
+```rust
+/// Execute `tell application "<app>" to <command>`.
+/// Returns the AppleScript result string (or null pointer on failure).
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_script_tell(
+    app: *const u8, app_len: u32,
+    command: *const u8, command_len: u32,
+    launch_if_needed: u8,
+    out_len: *mut u64,
+) -> *mut u8 {
+    let app_name = unsafe { str_from_buf(app, app_len) };
+    let cmd = unsafe { str_from_buf(command, command_len) };
+
+    if launch_if_needed != 0 {
+        // Check NSWorkspace for running app, launch if absent
+        let _ = crate::apps::launch_app_by_name(app_name);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    let script = format!("tell application \"{}\" to {}", app_name, cmd);
+    match crate::scripting::execute(&script) {
+        Ok(result) => match result {
+            Some(s) => vec_to_ffi(s.into_bytes(), out_len),
+            None => { unsafe { *out_len = 0; } ptr::null_mut() }
+        },
+        Err(_) => { unsafe { *out_len = 0; } ptr::null_mut() }
+    }
+}
+
+/// Execute a full AppleScript source. Returns JSON-encoded result.
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_script_eval(
+    source: *const u8, source_len: u32,
+    out_len: *mut u64,
+) -> *mut u8 { /* ... */ }
+
+/// Check if an app has a scripting dictionary.
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_script_can_script(
+    app: *const u8, app_len: u32,
+) -> u8 { /* 1 = yes, 0 = no */ }
+```
+
+### When to use Script vs AX
+
+```
+Agent decides to control Spotify:
+
+  1. Is Spotify scriptable?
+     → Script.canScript("Spotify") → true
+
+  2. Use Script for semantic actions:
+     → Script.tell("Spotify", "play track \"spotify:track:xxx\"")
+     → Script.tell("Spotify", "set sound volume to 75")
+     → Script.tell("Spotify", "next track")
+
+  3. Use AX only when you need UI structure:
+     → e.g., reading the layout of the "Now Playing" view for a screenshot
+     → or clicking a custom UI element that has no scripting verb
+
+Agent decides to control a random Electron app:
+
+  1. Is it scriptable?
+     → Script.canScript("SomeElectronApp") → false
+
+  2. Fall back to AX entirely:
+     → App.find("SomeElectronApp") → windows → findAll → click
+```
+
+---
+
+## App Profiles
+
+App profiles are bundled metadata about well-known applications — their
+scripting verbs, AX landmarks, and keyboard shortcuts. They let agents skip
+exploratory AX tree walking for common operations.
+
+```typescript
+// casper/profiles/types.ts
+export interface AppProfile {
+  bundleId: string;
+  name: string;
+  scriptable: boolean;
+
+  /** AppleScript verb templates. Keyed by action name. */
+  verbs?: Record<string, string | ((...args: unknown[]) => string)>;
+
+  /** Well-known keyboard shortcuts. */
+  shortcuts?: Record<string, string>;
+
+  /** AppleScript expressions that return state. */
+  queries?: Record<string, string>;
+
+  /** AX element landmarks — known identifiers/roles for key UI elements. */
+  landmarks?: Record<string, ElementQuery>;
+}
+```
+
+### Example: Spotify
+
+```typescript
+// casper/profiles/spotify.ts
+import type { AppProfile } from "./types.ts";
+
+export const spotify: AppProfile = {
+  bundleId: "com.spotify.client",
+  name: "Spotify",
+  scriptable: true,
+
+  verbs: {
+    play: (uri?: string) => uri ? `play track "${uri}"` : "play",
+    pause: "pause",
+    toggle: "playpause",
+    next: "next track",
+    previous: "previous track",
+    volume: (n: number) => `set sound volume to ${n}`,
+    seek: (seconds: number) => `set player position to ${seconds}`,
+    shuffle: "set shuffling to not shuffling",
+    repeat: "set repeating to not repeating",
+  },
+
+  shortcuts: {
+    search: "cmd+k",
+    preferences: "cmd+,",
+    newPlaylist: "cmd+n",
+  },
+
+  queries: {
+    nowPlaying: `
+      set a to artist of current track
+      set t to name of current track
+      set al to album of current track
+      set d to duration of current track
+      set p to player position
+      set s to player state as string
+      set u to spotify url of current track
+      set art to artwork url of current track
+      return {artist:a, track:t, album:al, duration:d, position:p, state:s, url:u, artwork:art}
+    `,
+    isPlaying: "return player state is playing",
+    currentVolume: "return sound volume",
+    isShuffling: "return shuffling",
+    isRepeating: "return repeating",
+  },
+
+  landmarks: {
+    searchField: { role: "AXTextField", identifier: "search-input" },
+    playButton: { role: "AXButton", label: "Play" },
+    nowPlayingBar: { role: "AXGroup", identifier: "now-playing-bar" },
+  },
+};
+```
+
+### Example: Safari
+
+```typescript
+// casper/profiles/safari.ts
+import type { AppProfile } from "./types.ts";
+
+export const safari: AppProfile = {
+  bundleId: "com.apple.Safari",
+  name: "Safari",
+  scriptable: true,
+
+  verbs: {
+    openUrl: (url: string) => `open location "${url}"`,
+    currentUrl: "return URL of current tab of front window",
+    currentTitle: "return name of current tab of front window",
+    newTab: (url?: string) => url
+      ? `tell front window to set current tab to (make new tab with properties {URL:"${url}"})`
+      : "tell front window to make new tab",
+    closeTab: "close current tab of front window",
+    listTabs: `
+      set tabList to {}
+      tell front window
+        repeat with t in tabs
+          set end of tabList to {name of t, URL of t}
+        end repeat
+      end tell
+      return tabList
+    `,
+  },
+
+  shortcuts: {
+    addressBar: "cmd+l",
+    newTab: "cmd+t",
+    closeTab: "cmd+w",
+    reload: "cmd+r",
+    back: "cmd+[",
+    forward: "cmd+]",
+  },
+
+  landmarks: {
+    addressBar: { role: "AXTextField", identifier: "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD" },
+    webContent: { role: "AXWebArea" },
+  },
+};
+```
+
+### Example: Music
+
+```typescript
+// casper/profiles/music.ts
+import type { AppProfile } from "./types.ts";
+
+export const music: AppProfile = {
+  bundleId: "com.apple.Music",
+  name: "Music",
+  scriptable: true,
+
+  verbs: {
+    play: "play",
+    pause: "pause",
+    toggle: "playpause",
+    next: "next track",
+    previous: "back track",
+    volume: (n: number) => `set sound volume to ${n}`,
+    search: (query: string) => `search playlist "Library" for "${query}"`,
+  },
+
+  queries: {
+    nowPlaying: `
+      set a to artist of current track
+      set t to name of current track
+      set al to album of current track
+      set d to duration of current track
+      set p to player position
+      return {artist:a, track:t, album:al, duration:d, position:p}
+    `,
+  },
+};
+```
+
+### Profile registry
+
+```typescript
+// casper/profiles/mod.ts
+import { spotify } from "./spotify.ts";
+import { safari } from "./safari.ts";
+import { music } from "./music.ts";
+import type { AppProfile } from "./types.ts";
+
+const profiles = new Map<string, AppProfile>();
+
+function register(profile: AppProfile): void {
+  profiles.set(profile.bundleId, profile);
+  profiles.set(profile.name.toLowerCase(), profile);
+}
+
+register(spotify);
+register(safari);
+register(music);
+
+/** Look up a profile by bundle ID or app name. */
+export function getProfile(appOrBundleId: string): AppProfile | undefined {
+  return profiles.get(appOrBundleId) ?? profiles.get(appOrBundleId.toLowerCase());
+}
+```
+
+Profiles are **optional hints**, not requirements. If an agent has a profile,
+it can take the fast path. Without one, it falls back to AX exploration.
+
+---
+
+## Hybrid Control: Script + Web API + AX
+
+Real-world automation often combines multiple control planes. Casper provides
+the local planes (AX and Script); external API calls come from outside (e.g.,
+Tachikoma providers or direct `fetch` calls in agent code).
+
+### Pattern: search remotely, play locally
+
+```typescript
+// Agent-level code: Tachikoma handles the Spotify Web API
+const results = await tachikoma.call("spotify-search", { query: "Bohemian Rhapsody" });
+const track = results[0]; // { uri: "spotify:track:4uLU6hMCjMI75M1A2tKUQC", name: "..." }
+
+// Casper handles local playback — no UI fumbling needed
+await Script.tell("Spotify", `play track "${track.uri}"`, { launchIfNeeded: true });
+```
+
+This is **dramatically more reliable** than automating the Spotify search UI:
+
+| Approach | Steps | Failure modes |
+|---|---|---|
+| AX-only | Launch → find search field → type → wait → find result row → click | AX tree mismatch, wrong result clicked, timing issues |
+| Script-only | `tell Spotify to play track "uri"` | Need to know the URI already |
+| Hybrid (Web API + Script) | API search → `tell Spotify to play track "uri"` | Network for search, but local play is rock-solid |
+
+### Pattern: read state via Script, act via AX
+
+```typescript
+// Fast state read via AppleScript
+const state = await Script.eval(`
+  tell application "Spotify"
+    return {playerState:player state as string, track:name of current track}
+  end tell
+`);
+
+if (state.playerState === "paused") {
+  // Need to click a specific UI element? Use AX.
+  const spotify = await App.find("Spotify");
+  const win = await spotify.focusedWindow();
+  const customBtn = await win.find({ role: "AXButton", identifier: "some-custom-ui" });
+  await customBtn?.click();
+}
+```
+
+### Pattern: script with fallback to AX
+
+```typescript
+async function playTrack(uri: string): Promise<void> {
+  if (await Script.canScript("Spotify")) {
+    // Fast path: AppleScript
+    await Script.tell("Spotify", `play track "${uri}"`, { launchIfNeeded: true });
+  } else {
+    // Fallback: UI automation
+    const spotify = await App.launch("com.spotify.client");
+    await spotify.activate();
+    const win = await spotify.focusedWindow();
+    await Keyboard.hotkey("cmd+k");
+    const search = await win.waitFor({ role: "AXTextField" }, 3000);
+    await search.type(uri);
+    await Keyboard.press("return");
+  }
+}
+```
+
+---
+
+## Web Content Extensions
+
+Browser-hosted apps (Twitter/X, Gmail, Slack web) present challenges that
+native apps don't: deep AX trees, dynamic content, and elements behind an
+`AXWebArea` boundary.
+
+### Window.findInPage() — crossing the AXWebArea boundary
+
+Browser windows have an AX structure like:
+
+```
+AXWindow → AXSplitGroup → AXGroup → AXWebArea → (all page content here)
+```
+
+Standard `findAll()` searches the full subtree, but `findInPage()` makes
+intent explicit and could apply web-specific optimizations:
+
+```typescript
+export class Window extends Handle {
+  /** Find elements within the web content area (crosses AXWebArea boundary). */
+  async findInPage(query: ElementQuery): Promise<Element[]> {
+    const webArea = await this.find({ role: "AXWebArea" });
+    if (!webArea) return [];
+    return webArea.findAll(query);
+  }
+
+  /** Wait for an element within web content to appear. */
+  async waitForInPage(query: ElementQuery, timeoutMs = 10000): Promise<Element> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const results = await this.findInPage(query);
+      if (results[0]) return results[0];
+      await new Promise(r => setTimeout(r, 300));
+    }
+    throw new Error(`Timed out waiting for web element: ${JSON.stringify(query)}`);
+  }
+}
+```
+
+### Extended ElementQuery for web content
+
+Web content elements often lack clean titles but have DOM-specific AX
+attributes. The query interface should support these:
+
+```typescript
+export interface ElementQuery {
+  // Existing — works for all AX elements
+  role?: string;
+  title?: string;
+  titleContains?: string;
+  label?: string;
+  value?: string;
+  identifier?: string;
+  enabled?: boolean;
+
+  // New — especially useful for web content and Electron apps
+  description?: string;           // AXDescription (exact)
+  descriptionContains?: string;   // AXDescription (substring)
+  valueContains?: string;         // AXValue (substring)
+  roleDescription?: string;       // e.g. "link", "button", "heading", "article"
+  url?: string;                   // AXLink URL attribute (exact)
+  urlContains?: string;           // AXLink URL attribute (substring)
+  domId?: string;                 // AXDOMIdentifier
+  domClass?: string;              // matches within AXDOMClassList
+}
+```
+
+### Usage: opening a tweet
+
+```typescript
+const safari = await Browser.findOrLaunch("com.apple.Safari");
+
+// Use Script for navigation (faster than AX for scriptable browsers)
+await Script.tell("Safari", 'open location "https://x.com/user/status/123"');
+
+const win = await safari.focusedWindow();
+
+// Wait for the tweet to render in web content
+const tweet = await win.waitForInPage(
+  { role: "AXGroup", roleDescription: "article" },
+  10000,
+);
+
+// Interact with elements inside the tweet
+const likeBtn = await tweet.find({ role: "AXButton", label: "Like" });
+if (likeBtn) await likeBtn.click();
+
+// Or find a specific link within the page
+const link = await win.findInPage({
+  role: "AXLink",
+  urlContains: "/status/123",
+});
+```
+
+### Rust-side ElementQuery additions
+
+```rust
+#[derive(serde::Deserialize)]
+struct ElementQuery {
+    // existing fields...
+    role: Option<String>,
+    title: Option<String>,
+    #[serde(rename = "titleContains")]
+    title_contains: Option<String>,
+    label: Option<String>,
+    value: Option<String>,
+    identifier: Option<String>,
+    enabled: Option<bool>,
+
+    // new fields for web content
+    description: Option<String>,
+    #[serde(rename = "descriptionContains")]
+    description_contains: Option<String>,
+    #[serde(rename = "valueContains")]
+    value_contains: Option<String>,
+    #[serde(rename = "roleDescription")]
+    role_description: Option<String>,
+    url: Option<String>,
+    #[serde(rename = "urlContains")]
+    url_contains: Option<String>,
+    #[serde(rename = "domId")]
+    dom_id: Option<String>,
+    #[serde(rename = "domClass")]
+    dom_class: Option<String>,
+}
+
+impl ElementQuery {
+    fn matches(&self, elem: &crate::ax::AXElement) -> bool {
+        // ... existing checks ...
+
+        if let Some(ref desc) = self.description {
+            if elem.description().as_deref() != Some(desc.as_str()) { return false; }
+        }
+        if let Some(ref contains) = self.description_contains {
+            match elem.description() {
+                Some(d) if d.contains(contains.as_str()) => {}
+                _ => return false,
+            }
+        }
+        if let Some(ref contains) = self.value_contains {
+            match elem.value() {
+                Some(v) if v.contains(contains.as_str()) => {}
+                _ => return false,
+            }
+        }
+        if let Some(ref rd) = self.role_description {
+            if elem.role_description().as_deref() != Some(rd.as_str()) { return false; }
+        }
+        if let Some(ref url) = self.url {
+            if elem.ax_attr_string("AXURL").as_deref() != Some(url.as_str()) { return false; }
+        }
+        if let Some(ref contains) = self.url_contains {
+            match elem.ax_attr_string("AXURL") {
+                Some(u) if u.contains(contains.as_str()) => {}
+                _ => return false,
+            }
+        }
+        if let Some(ref dom_id) = self.dom_id {
+            if elem.ax_attr_string("AXDOMIdentifier").as_deref() != Some(dom_id.as_str()) { return false; }
+        }
+        if let Some(ref dom_class) = self.dom_class {
+            match elem.ax_attr_string("AXDOMClassList") {
+                Some(classes) if classes.contains(dom_class.as_str()) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+```
+
+---
+
+## File Layout (updated)
+
+```
+casper/
+├── deno.json
+├── Cargo.toml
+├── build.rs
+├── src/                          # Rust
+│   ├── lib.rs
+│   ├── ffi.rs                    # extern "C" — casper_* functions
+│   ├── handles.rs                # handle table
+│   ├── input.rs                  # CGEvent
+│   ├── ax.rs                     # AXUIElement
+│   ├── capture.rs                # screen/window capture
+│   ├── apps.rs                   # NSWorkspace
+│   ├── clipboard.rs              # NSPasteboard
+│   ├── permissions.rs            # TCC checks
+│   └── scripting.rs              # NSAppleScript / OSAScript
+└── deno/                         # TypeScript
+    ├── mod.ts                    # public API re-exports
+    ├── types.ts                  # Point, Rect, Size
+    ├── ffi/
+    │   ├── symbols.ts            # Deno.dlopen + symbol defs
+    │   ├── handles.ts            # Handle base class
+    │   └── helpers.ts            # pointer/buffer utils
+    ├── entities/
+    │   ├── app.ts                # App entity
+    │   ├── window.ts             # Window entity
+    │   ├── element.ts            # Element entity (AX)
+    │   ├── keyboard.ts           # Keyboard singleton
+    │   ├── mouse.ts              # Mouse singleton
+    │   ├── screen.ts             # Screen singleton
+    │   ├── clipboard.ts          # Clipboard singleton
+    │   ├── browser.ts            # Browser extends App
+    │   ├── tab.ts                # Tab entity
+    │   ├── finder.ts             # Finder extends App
+    │   ├── file.ts               # File entity
+    │   ├── dialog.ts             # Dialog entity
+    │   └── script.ts             # Script singleton (AppleScript)
+    └── profiles/
+        ├── types.ts              # AppProfile interface
+        ├── mod.ts                # Profile registry
+        ├── spotify.ts            # Spotify profile
+        ├── safari.ts             # Safari profile
+        └── music.ts              # Music profile
 ```
