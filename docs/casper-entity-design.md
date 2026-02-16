@@ -1,0 +1,1576 @@
+# Casper: Entity-Based Mac Automation
+
+Casper is an entity-oriented TypeScript API for macOS desktop automation,
+backed by Rust FFI to native macOS frameworks. Instead of flat function
+calls (`click(x, y)`, `listWindows(pid)`), everything is expressed as
+`Entity.action()`.
+
+```typescript
+const safari = await App.launch("com.apple.Safari");
+const win = (await safari.windows())[0];
+await win.focus();
+
+const buttons = await win.findAll({ role: "AXButton" });
+const submit = buttons.find(b => b.title === "Submit");
+await submit.click();
+
+await Keyboard.type("hello world");
+await Keyboard.hotkey("cmd+enter");
+
+const screenshot = await Screen.capture();
+await Deno.writeFile("/tmp/screen.png", screenshot);
+```
+
+## Entity Hierarchy
+
+```
+Casper (root)
+├── Screen
+│   ├── .capture() → Uint8Array
+│   ├── .captureArea(rect) → Uint8Array
+│   └── .displays() → Display[]
+│
+├── App
+│   ├── .launch(bundleId) → App          (static)
+│   ├── .frontmost() → App               (static)
+│   ├── .all() → App[]                   (static)
+│   ├── .find(name | bundleId) → App     (static)
+│   │
+│   ├── .pid → number
+│   ├── .name → string
+│   ├── .bundleId → string
+│   ├── .activate()
+│   ├── .quit(force?)
+│   ├── .hide()
+│   ├── .unhide()
+│   ├── .windows() → Window[]
+│   ├── .focusedWindow() → Window
+│   ├── .menu(path) → MenuItem
+│   ├── .menus() → MenuItem[]
+│   └── .isRunning → boolean
+│
+├── Window
+│   ├── .focus()
+│   ├── .close()
+│   ├── .minimize()
+│   ├── .maximize()
+│   ├── .move(point)
+│   ├── .resize(size)
+│   ├── .bounds() → Rect
+│   ├── .capture() → Uint8Array
+│   ├── .app → App
+│   ├── .title → string
+│   ├── .id → number
+│   ├── .findAll(query) → Element[]
+│   ├── .find(query) → Element | null
+│   └── .waitFor(query, timeout?) → Element
+│
+├── Element (AX UI element)
+│   ├── .role → string
+│   ├── .title → string | null
+│   ├── .label → string | null
+│   ├── .value → string | null
+│   ├── .bounds → Rect
+│   ├── .isEnabled → boolean
+│   │
+│   ├── .click()
+│   ├── .doubleClick()
+│   ├── .rightClick()
+│   ├── .focus()
+│   ├── .type(text)
+│   ├── .clear()
+│   ├── .press(action)          → AXPress, AXConfirm, etc.
+│   ├── .scrollTo()
+│   │
+│   ├── .parent() → Element
+│   ├── .children() → Element[]
+│   ├── .findAll(query) → Element[]
+│   └── .find(query) → Element | null
+│
+├── Browser (extends App)
+│   ├── .open(bundleId?) → Browser       (static, defaults to default browser)
+│   ├── .tabs() → Tab[]
+│   ├── .activeTab() → Tab
+│   └── .newTab(url?) → Tab
+│
+├── Tab (browser tab)
+│   ├── .url → string
+│   ├── .title → string
+│   ├── .navigate(url)
+│   ├── .reload()
+│   ├── .close()
+│   ├── .activate()
+│   └── .window → Window
+│
+├── Finder (extends App)
+│   ├── .open(path?) → Finder            (static)
+│   ├── .selectedFiles() → File[]
+│   ├── .currentFolder() → string
+│   ├── .navigate(path)
+│   └── .reveal(path) → File
+│
+├── File
+│   ├── .path → string
+│   ├── .name → string
+│   ├── .open()
+│   ├── .openWith(appBundleId)
+│   ├── .reveal()                         → show in Finder
+│   ├── .trash()
+│   ├── .copyTo(dest)
+│   └── .moveTo(dest)
+│
+├── Keyboard
+│   ├── .type(text, opts?)
+│   ├── .hotkey(keys)
+│   ├── .press(key)
+│   ├── .keyDown(key)
+│   └── .keyUp(key)
+│
+├── Mouse
+│   ├── .click(point, opts?)
+│   ├── .doubleClick(point)
+│   ├── .rightClick(point)
+│   ├── .move(point)
+│   ├── .drag(from, to, opts?)
+│   ├── .scroll(direction, amount?)
+│   └── .position() → Point
+│
+├── Clipboard
+│   ├── .read() → string
+│   ├── .write(text)
+│   ├── .readImage() → Uint8Array | null
+│   └── .clear()
+│
+├── Dialog (active system dialog)
+│   ├── .find(opts?) → Dialog | null      (static)
+│   ├── .title → string
+│   ├── .buttons() → Element[]
+│   ├── .textFields() → Element[]
+│   ├── .clickButton(name)
+│   ├── .enterText(text, field?)
+│   └── .dismiss()
+│
+├── Menu
+│   ├── .click(path)                      → "File > Save As..."
+│   └── .items() → MenuItem[]
+│
+└── Permissions
+    ├── .check() → PermissionsStatus
+    ├── .accessibility → boolean
+    └── .screenRecording → boolean
+```
+
+## Design Principles
+
+### 1. Entities hold handles, not data
+
+Each entity instance holds a **handle** — an opaque numeric ID that maps
+to a Rust-side object (an `AXUIElement`, a PID, a window ID, etc.). The
+handle stays valid until explicitly released.
+
+```typescript
+// App holds a PID
+const safari = await App.find("Safari");
+safari.pid;        // 12345
+
+// Window holds a CGWindowID + AX element handle
+const win = (await safari.windows())[0];
+win.id;            // 9001 (CGWindowID)
+win._handle;       // 42 (Rust handle table index)
+
+// Element holds an AX element handle
+const btn = await win.find({ role: "AXButton", title: "OK" });
+btn._handle;       // 43 (Rust handle table index)
+await btn.click(); // calls Rust with handle 43
+```
+
+### 2. Queries, not raw coordinates
+
+Elements are found by **query objects**, not screen coordinates. The query
+matches against AX attributes:
+
+```typescript
+interface ElementQuery {
+  role?: string;          // "AXButton", "AXTextField", "AXLink"
+  title?: string;         // exact match
+  titleContains?: string; // substring
+  label?: string;         // AXDescription
+  value?: string;         // AXValue
+  identifier?: string;    // AXIdentifier
+  enabled?: boolean;      // filter by enabled state
+}
+
+// Find all enabled buttons
+const buttons = await win.findAll({ role: "AXButton", enabled: true });
+
+// Find a specific text field
+const email = await win.find({ role: "AXTextField", label: "Email" });
+
+// Wait for an element to appear (polls AX tree)
+const spinner = await win.waitFor({ role: "AXBusyIndicator" }, 5000);
+```
+
+### 3. Actions are async
+
+All actions that touch macOS APIs are `async`. This keeps the Deno event
+loop responsive and allows using `nonblocking: true` in `Deno.dlopen` for
+operations that might be slow (AX tree walks, screen capture).
+
+### 4. Using blocks for disposable contexts
+
+Entities that hold handles should be disposable. Using `Deno.Disposable`
+(`using` keyword) or explicit `.dispose()`:
+
+```typescript
+{
+  using app = await App.launch("com.apple.TextEdit");
+  const win = (await app.windows())[0];
+  const field = await win.find({ role: "AXTextArea" });
+  await field.type("Hello from Casper");
+  await Keyboard.hotkey("cmd+s");
+} // app handle released, AX element handles freed
+```
+
+---
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Deno — TypeScript                                           │
+│                                                              │
+│  ┌─────────────────────────────────────────┐                 │
+│  │  Entity Layer (casper/)                 │                 │
+│  │                                         │                 │
+│  │  App  Window  Element  Browser  Finder  │                 │
+│  │  Mouse  Keyboard  Screen  Clipboard     │                 │
+│  │  Dialog  File  Tab  Menu                │                 │
+│  └──────────────┬──────────────────────────┘                 │
+│                 │ calls                                       │
+│  ┌──────────────▼──────────────────────────┐                 │
+│  │  FFI Bridge (casper/ffi/)               │                 │
+│  │                                         │                 │
+│  │  ffi.ts       — Deno.dlopen symbols     │                 │
+│  │  handles.ts   — handle lifecycle mgmt   │                 │
+│  │  helpers.ts   — pointer/buffer utils    │                 │
+│  └──────────────┬──────────────────────────┘                 │
+│                 │ Deno.dlopen                                 │
+└─────────────────┼────────────────────────────────────────────┘
+                  │
+┌─────────────────▼────────────────────────────────────────────┐
+│  Rust — libcasper.dylib                                      │
+│                                                              │
+│  ┌─────────────────────────────────────────┐                 │
+│  │  FFI Surface (ffi.rs)                   │                 │
+│  │                                         │                 │
+│  │  casper_* extern "C" functions          │                 │
+│  │  Handle-based dispatch                  │                 │
+│  └──────────────┬──────────────────────────┘                 │
+│                 │                                             │
+│  ┌──────────────▼──────────────────────────┐                 │
+│  │  Handle Table (handles.rs)              │                 │
+│  │                                         │                 │
+│  │  HashMap<u64, HandleEntry>              │                 │
+│  │  Tracks: AXElements, PIDs, WindowIDs    │                 │
+│  │  Ref-counted, thread-safe               │                 │
+│  └──────────────┬──────────────────────────┘                 │
+│                 │                                             │
+│  ┌──────────────▼──────────────────────────┐                 │
+│  │  Core Modules                           │                 │
+│  │                                         │                 │
+│  │  ax.rs   input.rs   capture.rs          │                 │
+│  │  apps.rs  clipboard.rs  permissions.rs  │                 │
+│  └─────────────────────────────────────────┘                 │
+│                 │                                             │
+│                 ▼                                             │
+│  macOS: ApplicationServices, CoreGraphics, AppKit            │
+└──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Rust: Handle Table
+
+The central design change from the flat FFI approach. The Rust side maintains
+a table of live objects that Deno holds references to.
+
+```rust
+// handles.rs
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
+static HANDLE_TABLE: Mutex<Option<HashMap<u64, HandleEntry>>> = Mutex::new(None);
+
+pub enum HandleEntry {
+    /// An AXUIElement reference (for windows, elements, menus)
+    AXElement(crate::ax::AXElement),
+
+    /// An application (PID + AXUIElement for the app)
+    App {
+        pid: i32,
+        bundle_id: String,
+        name: String,
+        ax: crate::ax::AXElement,
+    },
+
+    /// A window (CGWindowID + AX element + owning app PID)
+    Window {
+        window_id: u32,
+        pid: i32,
+        ax: crate::ax::AXElement,
+    },
+}
+
+fn table() -> std::sync::MutexGuard<'static, Option<HashMap<u64, HandleEntry>>> {
+    let mut guard = HANDLE_TABLE.lock().unwrap();
+    if guard.is_none() {
+        *guard = Some(HashMap::new());
+    }
+    guard
+}
+
+/// Insert a new entry, return its handle ID.
+pub fn insert(entry: HandleEntry) -> u64 {
+    let id = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    table().as_mut().unwrap().insert(id, entry);
+    id
+}
+
+/// Get a reference to an entry by handle.
+pub fn get(handle: u64) -> Option<std::sync::MutexGuard<'static, Option<HashMap<u64, HandleEntry>>>> {
+    let guard = table();
+    if guard.as_ref().unwrap().contains_key(&handle) {
+        Some(guard)
+    } else {
+        None
+    }
+}
+
+/// Remove and drop an entry.
+pub fn release(handle: u64) {
+    table().as_mut().unwrap().remove(&handle);
+}
+
+/// Release all handles (cleanup).
+pub fn release_all() {
+    table().as_mut().unwrap().clear();
+}
+```
+
+### Why handles matter
+
+Without handles, every operation requires re-querying the AX tree:
+
+```typescript
+// BAD: re-walks the tree every call
+const buttons = await mac_find_elements_by_role(pid, "AXButton", 10);
+// Returns JSON snapshots — the elements are gone. You get data, not references.
+// To click, you need coordinates. If the UI shifted, coordinates are stale.
+```
+
+With handles, the Rust side holds a live `AXUIElement` reference:
+
+```typescript
+// GOOD: holds a reference
+const btn = await win.find({ role: "AXButton", title: "OK" });
+// btn._handle = 43, pointing at a live AXUIElement in Rust
+
+// Can query its *current* position at click time
+await btn.click();
+// Rust: reads btn's current frame from AX, clicks center of it
+// Works even if the UI moved since the query
+```
+
+---
+
+## Rust: Handle-Based FFI Surface
+
+```rust
+// ffi.rs — Casper's extern "C" surface, handle-oriented
+
+use crate::handles;
+use std::ptr;
+
+// ================================================================
+// Buffer helpers (same as before)
+// ================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_free_buffer(ptr: *mut u8, len: u64) { /* ... */ }
+
+fn vec_to_ffi(data: Vec<u8>, out_len: *mut u64) -> *mut u8 { /* ... */ }
+fn json_to_ffi<T: serde::Serialize>(value: &T, out_len: *mut u64) -> *mut u8 { /* ... */ }
+unsafe fn str_from_buf(ptr: *const u8, len: u32) -> &'static str { /* ... */ }
+
+// ================================================================
+// Lifecycle
+// ================================================================
+
+/// Release a handle. Frees the Rust-side object.
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_release(handle: u64) {
+    handles::release(handle);
+}
+
+/// Release all handles. Call on shutdown.
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_release_all() {
+    handles::release_all();
+}
+
+// ================================================================
+// App
+// ================================================================
+
+/// List all running GUI apps. Returns JSON array, each with a `handle` field.
+/// Each app is inserted into the handle table.
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_app_all(out_len: *mut u64) -> *mut u8 {
+    let apps = crate::apps::list_applications();
+    let result: Vec<serde_json::Value> = apps.into_iter().map(|app| {
+        let ax = crate::ax::application(app.pid);
+        ax.set_timeout(10.0);
+        let handle = handles::insert(handles::HandleEntry::App {
+            pid: app.pid,
+            bundle_id: app.bundle_id.clone().unwrap_or_default(),
+            name: app.name.clone().unwrap_or_default(),
+            ax,
+        });
+        serde_json::json!({
+            "handle": handle,
+            "pid": app.pid,
+            "bundleId": app.bundle_id,
+            "name": app.name,
+            "isActive": app.is_active,
+            "isHidden": app.is_hidden,
+        })
+    }).collect();
+    json_to_ffi(&result, out_len)
+}
+
+/// Get the frontmost app. Returns JSON with handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_app_frontmost(out_len: *mut u64) -> *mut u8 {
+    match crate::apps::frontmost_application() {
+        Some(app) => {
+            let ax = crate::ax::application(app.pid);
+            ax.set_timeout(10.0);
+            let handle = handles::insert(handles::HandleEntry::App {
+                pid: app.pid,
+                bundle_id: app.bundle_id.clone().unwrap_or_default(),
+                name: app.name.clone().unwrap_or_default(),
+                ax,
+            });
+            let value = serde_json::json!({
+                "handle": handle,
+                "pid": app.pid,
+                "bundleId": app.bundle_id,
+                "name": app.name,
+            });
+            json_to_ffi(&value, out_len)
+        }
+        None => { unsafe { *out_len = 0; } ptr::null_mut() }
+    }
+}
+
+/// Launch an app by bundle ID. Returns JSON with handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_app_launch(
+    bundle_id: *const u8, bundle_id_len: u32,
+    out_len: *mut u64,
+) -> *mut u8 {
+    let id = unsafe { str_from_buf(bundle_id, bundle_id_len) };
+    if crate::apps::launch_app(id).is_err() {
+        unsafe { *out_len = 0; }
+        return ptr::null_mut();
+    }
+    // Wait briefly for launch, then query
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    casper_app_find(bundle_id, bundle_id_len, out_len)
+}
+
+/// Find a running app by bundle ID or name. Returns JSON with handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_app_find(
+    query: *const u8, query_len: u32,
+    out_len: *mut u64,
+) -> *mut u8 {
+    let q = unsafe { str_from_buf(query, query_len) };
+    let apps = crate::apps::list_applications();
+    let found = apps.into_iter().find(|a| {
+        a.bundle_id.as_deref() == Some(q)
+            || a.name.as_deref().map(|n| n.eq_ignore_ascii_case(q)).unwrap_or(false)
+    });
+    match found {
+        Some(app) => {
+            let ax = crate::ax::application(app.pid);
+            ax.set_timeout(10.0);
+            let handle = handles::insert(handles::HandleEntry::App {
+                pid: app.pid,
+                bundle_id: app.bundle_id.clone().unwrap_or_default(),
+                name: app.name.clone().unwrap_or_default(),
+                ax,
+            });
+            let value = serde_json::json!({
+                "handle": handle,
+                "pid": app.pid,
+                "bundleId": app.bundle_id,
+                "name": app.name,
+            });
+            json_to_ffi(&value, out_len)
+        }
+        None => { unsafe { *out_len = 0; } ptr::null_mut() }
+    }
+}
+
+/// Activate an app by handle. Returns 0 on success.
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_app_activate(handle: u64) -> i32 {
+    let table = handles::table();
+    let map = table.as_ref().unwrap();
+    match map.get(&handle) {
+        Some(handles::HandleEntry::App { bundle_id, .. }) => {
+            match crate::apps::activate_app(bundle_id) {
+                Ok(()) => 0,
+                Err(_) => -1,
+            }
+        }
+        _ => -1,
+    }
+}
+
+/// Quit an app by handle. force: 0=graceful, 1=force.
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_app_quit(handle: u64, force: u8) -> i32 {
+    let table = handles::table();
+    let map = table.as_ref().unwrap();
+    match map.get(&handle) {
+        Some(handles::HandleEntry::App { bundle_id, .. }) => {
+            match crate::apps::quit_app(bundle_id, force != 0) {
+                Ok(_) => { drop(table); handles::release(handle); 0 }
+                Err(_) => -1,
+            }
+        }
+        _ => -1,
+    }
+}
+
+/// Get windows for an app handle. Returns JSON array with window handles.
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_app_windows(handle: u64, out_len: *mut u64) -> *mut u8 {
+    let table = handles::table();
+    let map = table.as_ref().unwrap();
+    match map.get(&handle) {
+        Some(handles::HandleEntry::App { pid, ax, .. }) => {
+            let windows = ax.windows();
+            let result: Vec<serde_json::Value> = windows.into_iter().map(|w| {
+                let title = w.title();
+                let (x, y, width, height) = w.frame().unwrap_or((0.0, 0.0, 0.0, 0.0));
+                let win_handle = handles::insert(handles::HandleEntry::Window {
+                    window_id: 0, // resolved via AXWindowResolver if needed
+                    pid: *pid,
+                    ax: w,
+                });
+                serde_json::json!({
+                    "handle": win_handle,
+                    "title": title,
+                    "bounds": { "x": x, "y": y, "width": width, "height": height },
+                })
+            }).collect();
+            json_to_ffi(&result, out_len)
+        }
+        _ => { unsafe { *out_len = 0; } ptr::null_mut() }
+    }
+}
+
+// ================================================================
+// Window
+// ================================================================
+
+/// Focus a window by handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_window_focus(handle: u64) -> i32 {
+    let table = handles::table();
+    let map = table.as_ref().unwrap();
+    match map.get(&handle) {
+        Some(handles::HandleEntry::Window { ax, .. }) => {
+            match ax.perform_action("AXRaise") {
+                Ok(()) => 0,
+                Err(_) => -1,
+            }
+        }
+        _ => -1,
+    }
+}
+
+/// Close a window by handle.
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_window_close(handle: u64) -> i32 {
+    // Press the close button via AX
+    let table = handles::table();
+    let map = table.as_ref().unwrap();
+    match map.get(&handle) {
+        Some(handles::HandleEntry::Window { ax, .. }) => {
+            // AXCloseButton attribute → perform AXPress
+            if let Some(btn) = ax.ax_attr_element("AXCloseButton") {
+                match btn.perform_action("AXPress") {
+                    Ok(()) => 0,
+                    Err(_) => -1,
+                }
+            } else { -1 }
+        }
+        _ => -1,
+    }
+}
+
+/// Capture a window as PNG by handle. Returns bytes pointer.
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_window_capture(handle: u64, out_len: *mut u64) -> *mut u8 {
+    let table = handles::table();
+    let map = table.as_ref().unwrap();
+    match map.get(&handle) {
+        Some(handles::HandleEntry::Window { window_id, .. }) if *window_id != 0 => {
+            match crate::capture::capture_window(*window_id) {
+                Ok(png) => vec_to_ffi(png, out_len),
+                Err(_) => { unsafe { *out_len = 0; } ptr::null_mut() }
+            }
+        }
+        _ => { unsafe { *out_len = 0; } ptr::null_mut() }
+    }
+}
+
+/// Find elements within a window. query_json is a JSON ElementQuery.
+/// Returns JSON array of elements with handles.
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_window_find_all(
+    handle: u64,
+    query_json: *const u8, query_len: u32,
+    out_len: *mut u64,
+) -> *mut u8 {
+    let query_str = unsafe { str_from_buf(query_json, query_len) };
+    let query: ElementQuery = match serde_json::from_str(query_str) {
+        Ok(q) => q,
+        Err(_) => { unsafe { *out_len = 0; } return ptr::null_mut(); }
+    };
+
+    let table = handles::table();
+    let map = table.as_ref().unwrap();
+    let ax = match map.get(&handle) {
+        Some(handles::HandleEntry::Window { ax, .. }) => ax,
+        _ => { unsafe { *out_len = 0; } return ptr::null_mut(); }
+    };
+
+    let matches = ax.find_all(12, &|elem| query.matches(elem));
+
+    let result: Vec<serde_json::Value> = matches.into_iter().map(|e| {
+        let (x, y, w, h) = e.frame().unwrap_or((0.0, 0.0, 0.0, 0.0));
+        let role = e.role();
+        let title = e.title();
+        let label = e.label();
+        let value = e.value();
+        let elem_handle = handles::insert(handles::HandleEntry::AXElement(e));
+        serde_json::json!({
+            "handle": elem_handle,
+            "role": role,
+            "title": title,
+            "label": label,
+            "value": value,
+            "bounds": { "x": x, "y": y, "width": w, "height": h },
+        })
+    }).collect();
+    json_to_ffi(&result, out_len)
+}
+
+// ================================================================
+// Element
+// ================================================================
+
+/// Click an element by handle. Reads current position from AX.
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_element_click(handle: u64, click_type: u8) -> i32 {
+    let table = handles::table();
+    let map = table.as_ref().unwrap();
+    let ax = match map.get(&handle) {
+        Some(handles::HandleEntry::AXElement(ax)) => ax,
+        _ => return -1,
+    };
+
+    // Read the element's current frame from AX (not cached)
+    let (x, y, w, h) = match ax.frame() {
+        Some(f) => f,
+        None => return -1,
+    };
+    let center_x = x + w / 2.0;
+    let center_y = y + h / 2.0;
+
+    drop(table); // release lock before input
+
+    let button = crate::input::MouseButton::Left;
+    let count = match click_type {
+        1 => 2, // double
+        2 => { // right click
+            return match crate::input::click(center_x, center_y,
+                crate::input::MouseButton::Right, 1) {
+                Ok(()) => 0, Err(_) => -1,
+            };
+        }
+        _ => 1, // single
+    };
+    match crate::input::click(center_x, center_y, button, count) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// Type text into an element. Focuses it first via AXFocused.
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_element_type(
+    handle: u64,
+    text: *const u8, text_len: u32,
+    delay_ms: u64,
+) -> i32 {
+    let text_str = unsafe { str_from_buf(text, text_len) };
+
+    // Focus the element first
+    {
+        let table = handles::table();
+        let map = table.as_ref().unwrap();
+        match map.get(&handle) {
+            Some(handles::HandleEntry::AXElement(ax)) => {
+                let _ = ax.perform_action("AXFocus");
+            }
+            _ => return -1,
+        }
+    }
+
+    // Brief pause for focus to take effect
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    match crate::input::type_text(text_str, delay_ms) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// Get current properties of an element. Returns JSON.
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_element_props(handle: u64, out_len: *mut u64) -> *mut u8 {
+    let table = handles::table();
+    let map = table.as_ref().unwrap();
+    match map.get(&handle) {
+        Some(handles::HandleEntry::AXElement(ax)) => {
+            let (x, y, w, h) = ax.frame().unwrap_or((0.0, 0.0, 0.0, 0.0));
+            let value = serde_json::json!({
+                "role": ax.role(),
+                "title": ax.title(),
+                "label": ax.label(),
+                "value": ax.value(),
+                "bounds": { "x": x, "y": y, "width": w, "height": h },
+            });
+            json_to_ffi(&value, out_len)
+        }
+        _ => { unsafe { *out_len = 0; } ptr::null_mut() }
+    }
+}
+
+/// Find children of an element matching a query. Returns JSON with handles.
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_element_find_all(
+    handle: u64,
+    query_json: *const u8, query_len: u32,
+    out_len: *mut u64,
+) -> *mut u8 {
+    // Same pattern as casper_window_find_all but scoped to element's subtree
+    // ...
+    todo!()
+}
+
+// ================================================================
+// Input (stateless — no handles)
+// ================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_keyboard_type(
+    text: *const u8, text_len: u32, delay_ms: u64,
+) -> i32 { /* ... */ }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_keyboard_hotkey(
+    keys: *const u8, keys_len: u32, hold_ms: u64,
+) -> i32 { /* ... */ }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_mouse_click(
+    x: f64, y: f64, button: u8, count: u32,
+) -> i32 { /* ... */ }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_mouse_move(x: f64, y: f64) -> i32 { /* ... */ }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_mouse_drag(
+    from_x: f64, from_y: f64, to_x: f64, to_y: f64,
+    steps: u32, delay_ms: u64,
+) -> i32 { /* ... */ }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_mouse_scroll(dx: i32, dy: i32) -> i32 { /* ... */ }
+
+// ================================================================
+// Screen capture (stateless)
+// ================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_screen_capture(
+    display_id: u32, out_len: *mut u64,
+) -> *mut u8 { /* ... */ }
+
+// ================================================================
+// Clipboard (stateless)
+// ================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_clipboard_read(out_len: *mut u64) -> *mut u8 { /* ... */ }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_clipboard_write(
+    text: *const u8, text_len: u32,
+) -> i32 { /* ... */ }
+
+// ================================================================
+// Permissions (stateless)
+// ================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_permissions_check(out_len: *mut u64) -> *mut u8 { /* ... */ }
+
+// ================================================================
+// ElementQuery — used by find operations
+// ================================================================
+
+#[derive(serde::Deserialize)]
+struct ElementQuery {
+    role: Option<String>,
+    title: Option<String>,
+    #[serde(rename = "titleContains")]
+    title_contains: Option<String>,
+    label: Option<String>,
+    value: Option<String>,
+    identifier: Option<String>,
+    enabled: Option<bool>,
+}
+
+impl ElementQuery {
+    fn matches(&self, elem: &crate::ax::AXElement) -> bool {
+        if let Some(ref role) = self.role {
+            if elem.role().as_deref() != Some(role.as_str()) { return false; }
+        }
+        if let Some(ref title) = self.title {
+            if elem.title().as_deref() != Some(title.as_str()) { return false; }
+        }
+        if let Some(ref contains) = self.title_contains {
+            match elem.title() {
+                Some(t) if t.contains(contains.as_str()) => {}
+                _ => return false,
+            }
+        }
+        if let Some(ref label) = self.label {
+            if elem.label().as_deref() != Some(label.as_str()) { return false; }
+        }
+        if let Some(ref value) = self.value {
+            if elem.value().as_deref() != Some(value.as_str()) { return false; }
+        }
+        // identifier, enabled checks...
+        true
+    }
+}
+```
+
+---
+
+## TypeScript: Entity Classes
+
+### casper/ffi/symbols.ts — Deno.dlopen
+
+```typescript
+const LIB_PATH = new URL(
+  "../../target/release/libcasper.dylib",
+  import.meta.url,
+);
+
+const lib = Deno.dlopen(LIB_PATH, {
+  // Lifecycle
+  casper_free_buffer: { parameters: ["pointer", "u64"], result: "void" },
+  casper_release: { parameters: ["u64"], result: "void" },
+  casper_release_all: { parameters: [], result: "void" },
+
+  // App
+  casper_app_all: { parameters: ["pointer"], result: "pointer" },
+  casper_app_frontmost: { parameters: ["pointer"], result: "pointer" },
+  casper_app_launch: { parameters: ["buffer", "u32", "pointer"], result: "pointer" },
+  casper_app_find: { parameters: ["buffer", "u32", "pointer"], result: "pointer" },
+  casper_app_activate: { parameters: ["u64"], result: "i32" },
+  casper_app_quit: { parameters: ["u64", "u8"], result: "i32" },
+  casper_app_windows: { parameters: ["u64", "pointer"], result: "pointer" },
+
+  // Window
+  casper_window_focus: { parameters: ["u64"], result: "i32" },
+  casper_window_close: { parameters: ["u64"], result: "i32" },
+  casper_window_capture: { parameters: ["u64", "pointer"], result: "pointer" },
+  casper_window_find_all: { parameters: ["u64", "buffer", "u32", "pointer"], result: "pointer" },
+
+  // Element
+  casper_element_click: { parameters: ["u64", "u8"], result: "i32" },
+  casper_element_type: { parameters: ["u64", "buffer", "u32", "u64"], result: "i32" },
+  casper_element_props: { parameters: ["u64", "pointer"], result: "pointer" },
+  casper_element_find_all: { parameters: ["u64", "buffer", "u32", "pointer"], result: "pointer" },
+
+  // Keyboard
+  casper_keyboard_type: { parameters: ["buffer", "u32", "u64"], result: "i32" },
+  casper_keyboard_hotkey: { parameters: ["buffer", "u32", "u64"], result: "i32" },
+
+  // Mouse
+  casper_mouse_click: { parameters: ["f64", "f64", "u8", "u32"], result: "i32" },
+  casper_mouse_move: { parameters: ["f64", "f64"], result: "i32" },
+  casper_mouse_drag: { parameters: ["f64", "f64", "f64", "f64", "u32", "u64"], result: "i32" },
+  casper_mouse_scroll: { parameters: ["i32", "i32"], result: "i32" },
+
+  // Screen
+  casper_screen_capture: { parameters: ["u32", "pointer"], result: "pointer" },
+
+  // Clipboard
+  casper_clipboard_read: { parameters: ["pointer"], result: "pointer" },
+  casper_clipboard_write: { parameters: ["buffer", "u32"], result: "i32" },
+
+  // Permissions
+  casper_permissions_check: { parameters: ["pointer"], result: "pointer" },
+});
+
+export default lib;
+export const sym = lib.symbols;
+```
+
+### casper/ffi/handles.ts — Handle Lifecycle
+
+```typescript
+import { sym } from "./symbols.ts";
+
+/** Base class for any entity that holds a Rust handle. */
+export class Handle implements Disposable {
+  readonly _handle: number;
+  #released = false;
+
+  constructor(handle: number) {
+    this._handle = handle;
+  }
+
+  /** Release the Rust-side object. */
+  dispose(): void {
+    if (!this.#released) {
+      sym.casper_release(BigInt(this._handle));
+      this.#released = true;
+    }
+  }
+
+  /** For `using` keyword support. */
+  [Symbol.dispose](): void {
+    this.dispose();
+  }
+}
+```
+
+### casper/entities/app.ts
+
+```typescript
+import { sym } from "../ffi/symbols.ts";
+import { callJson, encodeStr, assertOk } from "../ffi/helpers.ts";
+import { Handle } from "../ffi/handles.ts";
+import { Window } from "./window.ts";
+
+interface AppData {
+  handle: number;
+  pid: number;
+  bundleId: string | null;
+  name: string | null;
+  isActive?: boolean;
+  isHidden?: boolean;
+}
+
+export class App extends Handle {
+  readonly pid: number;
+  readonly bundleId: string;
+  readonly name: string;
+
+  private constructor(data: AppData) {
+    super(data.handle);
+    this.pid = data.pid;
+    this.bundleId = data.bundleId ?? "";
+    this.name = data.name ?? "";
+  }
+
+  // --- Static factories ---
+
+  static async all(): Promise<App[]> {
+    const apps = callJson<AppData[]>((out) => sym.casper_app_all(out));
+    return (apps ?? []).map((d) => new App(d));
+  }
+
+  static async frontmost(): Promise<App> {
+    const data = callJson<AppData>((out) => sym.casper_app_frontmost(out));
+    if (!data) throw new Error("No frontmost application");
+    return new App(data);
+  }
+
+  static async find(query: string): Promise<App> {
+    const [buf, len] = encodeStr(query);
+    const data = callJson<AppData>((out) =>
+      sym.casper_app_find(buf, len, out)
+    );
+    if (!data) throw new Error(`App not found: ${query}`);
+    return new App(data);
+  }
+
+  static async launch(bundleId: string): Promise<App> {
+    const [buf, len] = encodeStr(bundleId);
+    const data = callJson<AppData>((out) =>
+      sym.casper_app_launch(buf, len, out)
+    );
+    if (!data) throw new Error(`Failed to launch: ${bundleId}`);
+    return new App(data);
+  }
+
+  // --- Instance methods ---
+
+  async activate(): Promise<void> {
+    assertOk(sym.casper_app_activate(BigInt(this._handle)), "activate");
+  }
+
+  async quit(force = false): Promise<void> {
+    assertOk(
+      sym.casper_app_quit(BigInt(this._handle), force ? 1 : 0),
+      "quit",
+    );
+  }
+
+  async hide(): Promise<void> {
+    // ... delegate to FFI
+  }
+
+  async windows(): Promise<Window[]> {
+    const wins = callJson<Window.Data[]>((out) =>
+      sym.casper_app_windows(BigInt(this._handle), out)
+    );
+    return (wins ?? []).map((d) => new Window(d, this));
+  }
+
+  async focusedWindow(): Promise<Window> {
+    const wins = await this.windows();
+    return wins[0]; // first window is typically the focused one
+  }
+}
+```
+
+### casper/entities/window.ts
+
+```typescript
+import { sym } from "../ffi/symbols.ts";
+import { callJson, callBytes, encodeStr, assertOk } from "../ffi/helpers.ts";
+import { Handle } from "../ffi/handles.ts";
+import { Element, type ElementQuery } from "./element.ts";
+import type { App } from "./app.ts";
+import type { Rect } from "../types.ts";
+
+export class Window extends Handle {
+  readonly title: string;
+  readonly app: App;
+  readonly bounds: Rect;
+
+  /** @internal */
+  constructor(
+    data: { handle: number; title: string | null; bounds: Rect },
+    app: App,
+  ) {
+    super(data.handle);
+    this.title = data.title ?? "";
+    this.app = app;
+    this.bounds = data.bounds;
+  }
+
+  async focus(): Promise<void> {
+    assertOk(sym.casper_window_focus(BigInt(this._handle)), "focus");
+  }
+
+  async close(): Promise<void> {
+    assertOk(sym.casper_window_close(BigInt(this._handle)), "close");
+  }
+
+  async capture(): Promise<Uint8Array> {
+    const data = callBytes((out) =>
+      sym.casper_window_capture(BigInt(this._handle), out)
+    );
+    if (!data) throw new Error("Window capture failed");
+    return data;
+  }
+
+  async findAll(query: ElementQuery): Promise<Element[]> {
+    const [buf, len] = encodeStr(JSON.stringify(query));
+    const elements = callJson<Element.Data[]>((out) =>
+      sym.casper_window_find_all(BigInt(this._handle), buf, len, out)
+    );
+    return (elements ?? []).map((d) => new Element(d));
+  }
+
+  async find(query: ElementQuery): Promise<Element | null> {
+    const all = await this.findAll(query);
+    return all[0] ?? null;
+  }
+
+  /** Wait for an element matching the query to appear. Polls with timeout. */
+  async waitFor(query: ElementQuery, timeoutMs = 5000): Promise<Element> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const el = await this.find(query);
+      if (el) return el;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    throw new Error(`Timed out waiting for element: ${JSON.stringify(query)}`);
+  }
+}
+```
+
+### casper/entities/element.ts
+
+```typescript
+import { sym } from "../ffi/symbols.ts";
+import { callJson, encodeStr, assertOk } from "../ffi/helpers.ts";
+import { Handle } from "../ffi/handles.ts";
+import type { Rect } from "../types.ts";
+
+export interface ElementQuery {
+  role?: string;
+  title?: string;
+  titleContains?: string;
+  label?: string;
+  value?: string;
+  identifier?: string;
+  enabled?: boolean;
+}
+
+export class Element extends Handle {
+  readonly role: string | null;
+  readonly title: string | null;
+  readonly label: string | null;
+  readonly value: string | null;
+  readonly bounds: Rect;
+
+  /** @internal */
+  constructor(data: Element.Data) {
+    super(data.handle);
+    this.role = data.role;
+    this.title = data.title;
+    this.label = data.label;
+    this.value = data.value;
+    this.bounds = data.bounds;
+  }
+
+  /** Re-read current properties from the live AX element. */
+  async refresh(): Promise<Element.Props> {
+    return callJson<Element.Props>((out) =>
+      sym.casper_element_props(BigInt(this._handle), out)
+    )!;
+  }
+
+  async click(): Promise<void> {
+    assertOk(sym.casper_element_click(BigInt(this._handle), 0), "click");
+  }
+
+  async doubleClick(): Promise<void> {
+    assertOk(sym.casper_element_click(BigInt(this._handle), 1), "doubleClick");
+  }
+
+  async rightClick(): Promise<void> {
+    assertOk(sym.casper_element_click(BigInt(this._handle), 2), "rightClick");
+  }
+
+  async type(text: string, delayMs = 50): Promise<void> {
+    const [buf, len] = encodeStr(text);
+    assertOk(
+      sym.casper_element_type(BigInt(this._handle), buf, len, BigInt(delayMs)),
+      "type",
+    );
+  }
+
+  async children(): Promise<Element[]> {
+    const [buf, len] = encodeStr("{}"); // empty query = all children
+    const elements = callJson<Element.Data[]>((out) =>
+      sym.casper_element_find_all(BigInt(this._handle), buf, len, out)
+    );
+    return (elements ?? []).map((d) => new Element(d));
+  }
+
+  async findAll(query: ElementQuery): Promise<Element[]> {
+    const [buf, len] = encodeStr(JSON.stringify(query));
+    const elements = callJson<Element.Data[]>((out) =>
+      sym.casper_element_find_all(BigInt(this._handle), buf, len, out)
+    );
+    return (elements ?? []).map((d) => new Element(d));
+  }
+
+  async find(query: ElementQuery): Promise<Element | null> {
+    const all = await this.findAll(query);
+    return all[0] ?? null;
+  }
+
+  toString(): string {
+    return `Element(${this.role} "${this.title ?? this.label ?? ""}")`;
+  }
+}
+
+export namespace Element {
+  export interface Data {
+    handle: number;
+    role: string | null;
+    title: string | null;
+    label: string | null;
+    value: string | null;
+    bounds: Rect;
+  }
+  export interface Props {
+    role: string | null;
+    title: string | null;
+    label: string | null;
+    value: string | null;
+    bounds: Rect;
+  }
+}
+```
+
+### casper/entities/keyboard.ts
+
+```typescript
+import { sym } from "../ffi/symbols.ts";
+import { encodeStr, assertOk } from "../ffi/helpers.ts";
+
+/** Global keyboard — no handle, stateless. */
+export const Keyboard = {
+  async type(text: string, delayMs = 50): Promise<void> {
+    const [buf, len] = encodeStr(text);
+    assertOk(
+      sym.casper_keyboard_type(buf, len, BigInt(delayMs)),
+      "Keyboard.type",
+    );
+  },
+
+  async hotkey(keys: string, holdMs = 0): Promise<void> {
+    const [buf, len] = encodeStr(keys);
+    assertOk(
+      sym.casper_keyboard_hotkey(buf, len, BigInt(holdMs)),
+      "Keyboard.hotkey",
+    );
+  },
+
+  async press(key: string): Promise<void> {
+    await this.hotkey(key);
+  },
+};
+```
+
+### casper/entities/mouse.ts
+
+```typescript
+import { sym } from "../ffi/symbols.ts";
+import { assertOk } from "../ffi/helpers.ts";
+import type { Point } from "../types.ts";
+
+/** Global mouse — no handle, stateless. */
+export const Mouse = {
+  async click(point: Point, button: "left" | "right" = "left", count = 1): Promise<void> {
+    const btn = button === "right" ? 1 : 0;
+    assertOk(sym.casper_mouse_click(point.x, point.y, btn, count), "Mouse.click");
+  },
+
+  async doubleClick(point: Point): Promise<void> {
+    await this.click(point, "left", 2);
+  },
+
+  async rightClick(point: Point): Promise<void> {
+    await this.click(point, "right");
+  },
+
+  async move(point: Point): Promise<void> {
+    assertOk(sym.casper_mouse_move(point.x, point.y), "Mouse.move");
+  },
+
+  async drag(from: Point, to: Point, steps = 20, stepDelayMs = 10): Promise<void> {
+    assertOk(
+      sym.casper_mouse_drag(from.x, from.y, to.x, to.y, steps, BigInt(stepDelayMs)),
+      "Mouse.drag",
+    );
+  },
+
+  async scroll(direction: "up" | "down" | "left" | "right", amount = 3): Promise<void> {
+    const [dx, dy] = {
+      up: [0, amount],
+      down: [0, -amount],
+      left: [amount, 0],
+      right: [-amount, 0],
+    }[direction];
+    assertOk(sym.casper_mouse_scroll(dx, dy), "Mouse.scroll");
+  },
+};
+```
+
+### casper/entities/screen.ts
+
+```typescript
+import { sym } from "../ffi/symbols.ts";
+import { callBytes } from "../ffi/helpers.ts";
+
+export const Screen = {
+  async capture(displayId = 0): Promise<Uint8Array> {
+    const data = callBytes((out) => sym.casper_screen_capture(displayId, out));
+    if (!data) throw new Error("Screen capture failed");
+    return data;
+  },
+};
+```
+
+### casper/entities/clipboard.ts
+
+```typescript
+import { sym } from "../ffi/symbols.ts";
+import { callBytes, encodeStr, assertOk } from "../ffi/helpers.ts";
+
+export const Clipboard = {
+  read(): string | null {
+    const data = callBytes((out) => sym.casper_clipboard_read(out));
+    if (!data) return null;
+    return new TextDecoder().decode(data);
+  },
+
+  write(text: string): void {
+    const [buf, len] = encodeStr(text);
+    assertOk(sym.casper_clipboard_write(buf, len), "Clipboard.write");
+  },
+
+  clear(): void {
+    this.write("");
+  },
+};
+```
+
+### casper/mod.ts — Public API
+
+```typescript
+// Casper — entity-based Mac automation for Deno
+
+export { App } from "./entities/app.ts";
+export { Window } from "./entities/window.ts";
+export { Element, type ElementQuery } from "./entities/element.ts";
+export { Keyboard } from "./entities/keyboard.ts";
+export { Mouse } from "./entities/mouse.ts";
+export { Screen } from "./entities/screen.ts";
+export { Clipboard } from "./entities/clipboard.ts";
+export type { Point, Rect, Size } from "./types.ts";
+
+import lib from "./ffi/symbols.ts";
+
+/** Shut down Casper. Releases all handles and closes the dylib. */
+export function shutdown(): void {
+  lib.symbols.casper_release_all();
+  lib.close();
+}
+```
+
+### casper/types.ts
+
+```typescript
+export interface Point { x: number; y: number }
+export interface Size { width: number; height: number }
+export interface Rect { x: number; y: number; width: number; height: number }
+```
+
+---
+
+## Usage: Agent Loop
+
+```typescript
+// agent.ts
+import { App, Window, Screen, Keyboard, Mouse, Clipboard, shutdown } from "./casper/mod.ts";
+
+// Check what's running
+const apps = await App.all();
+console.log(`${apps.length} apps running`);
+
+// Find Safari, or launch it
+let safari: App;
+try {
+  safari = await App.find("Safari");
+} catch {
+  safari = await App.launch("com.apple.Safari");
+}
+await safari.activate();
+
+// Get the main window
+const win = await safari.focusedWindow();
+console.log(`Window: "${win.title}"`);
+
+// Screenshot the window
+const png = await win.capture();
+await Deno.writeFile("/tmp/safari.png", png);
+
+// Find the URL bar and type into it
+const urlBar = await win.find({ role: "AXTextField", identifier: "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD" });
+if (urlBar) {
+  await urlBar.click();
+  await Keyboard.hotkey("cmd+a");
+  await Keyboard.type("https://example.com");
+  await Keyboard.press("return");
+}
+
+// Wait for page to load, then find links
+await new Promise(r => setTimeout(r, 2000));
+const links = await win.findAll({ role: "AXLink" });
+console.log(`Found ${links.length} links`);
+
+for (const link of links.slice(0, 3)) {
+  console.log(`  ${link.title} → (${link.bounds.x}, ${link.bounds.y})`);
+}
+
+// Click the first link
+if (links[0]) {
+  await links[0].click();
+}
+
+// Cleanup: release all AX handles
+apps.forEach(a => a.dispose());
+shutdown();
+```
+
+---
+
+## Usage: File Operations via Finder
+
+```typescript
+import { App, Keyboard } from "./casper/mod.ts";
+
+const finder = await App.find("Finder");
+await finder.activate();
+
+const win = await finder.focusedWindow();
+
+// Navigate using Go → Go to Folder
+await Keyboard.hotkey("cmd+shift+g");
+const dialog = await win.waitFor({ role: "AXSheet" }, 3000);
+const pathField = await dialog.find({ role: "AXTextField" });
+await pathField!.type("/Users/me/Documents");
+await Keyboard.press("return");
+
+// Select a file
+const files = await win.findAll({ role: "AXRow" });
+if (files[0]) {
+  await files[0].click();
+  // Open it
+  await Keyboard.hotkey("cmd+o");
+}
+```
+
+---
+
+## File Layout
+
+```
+casper/
+├── deno.json
+├── Cargo.toml
+├── build.rs
+├── src/                          # Rust
+│   ├── lib.rs
+│   ├── ffi.rs                    # extern "C" — casper_* functions
+│   ├── handles.rs                # handle table
+│   ├── input.rs                  # CGEvent
+│   ├── ax.rs                     # AXUIElement
+│   ├── capture.rs                # screen/window capture
+│   ├── apps.rs                   # NSWorkspace
+│   ├── clipboard.rs              # NSPasteboard
+│   └── permissions.rs            # TCC checks
+└── deno/                         # TypeScript
+    ├── mod.ts                    # public API re-exports
+    ├── types.ts                  # Point, Rect, Size
+    ├── ffi/
+    │   ├── symbols.ts            # Deno.dlopen + symbol defs
+    │   ├── handles.ts            # Handle base class
+    │   └── helpers.ts            # pointer/buffer utils
+    └── entities/
+        ├── app.ts                # App entity
+        ├── window.ts             # Window entity
+        ├── element.ts            # Element entity (AX)
+        ├── keyboard.ts           # Keyboard singleton
+        ├── mouse.ts              # Mouse singleton
+        ├── screen.ts             # Screen singleton
+        ├── clipboard.ts          # Clipboard singleton
+        ├── browser.ts            # Browser extends App
+        ├── tab.ts                # Tab entity
+        ├── finder.ts             # Finder extends App
+        ├── file.ts               # File entity
+        └── dialog.ts             # Dialog entity
+```
+
+---
+
+## Entity Classification
+
+| Entity | Handle type | Rust state | Stateless? |
+|---|---|---|---|
+| **App** | PID + AXUIElement | `HandleEntry::App` | No |
+| **Window** | CGWindowID + AXUIElement | `HandleEntry::Window` | No |
+| **Element** | AXUIElement | `HandleEntry::AXElement` | No |
+| **Tab** | AXUIElement (tab element) | `HandleEntry::AXElement` | No |
+| **Dialog** | AXUIElement (sheet/dialog) | `HandleEntry::AXElement` | No |
+| **Keyboard** | — | — | Yes |
+| **Mouse** | — | — | Yes |
+| **Screen** | — | — | Yes |
+| **Clipboard** | — | — | Yes |
+| **File** | path string | (no Rust state) | TS-only |
+| **Finder** | Inherits from App | `HandleEntry::App` | No |
+| **Browser** | Inherits from App | `HandleEntry::App` | No |
+
+---
+
+## How Handles Flow
+
+```
+1. App.find("Safari")
+   → casper_app_find("Safari")
+   → Rust: finds NSRunningApplication, creates AXUIElement
+   → Rust: inserts HandleEntry::App { pid, ax, ... } → handle=1
+   → Returns JSON: { "handle": 1, "pid": 12345, "name": "Safari" }
+   → TS: new App({ handle: 1, pid: 12345, name: "Safari" })
+
+2. app.windows()
+   → casper_app_windows(handle=1)
+   → Rust: reads handle 1 → app.ax.windows()
+   → Rust: inserts HandleEntry::Window for each → handles 2, 3
+   → Returns JSON: [{ "handle": 2, "title": "Google" }, ...]
+   → TS: [new Window({ handle: 2, title: "Google" }, app)]
+
+3. window.find({ role: "AXButton", title: "Submit" })
+   → casper_window_find_all(handle=2, '{"role":"AXButton","title":"Submit"}')
+   → Rust: reads handle 2 → window.ax.find_all(query)
+   → Rust: inserts HandleEntry::AXElement for match → handle 4
+   → Returns JSON: [{ "handle": 4, "role": "AXButton", "title": "Submit", ... }]
+   → TS: new Element({ handle: 4, ... })
+
+4. element.click()
+   → casper_element_click(handle=4)
+   → Rust: reads handle 4 → element.frame() → gets CURRENT position
+   → Rust: CGEventPost(click at center of element)
+   → Returns 0
+
+5. element.dispose()
+   → casper_release(handle=4)
+   → Rust: removes handle 4, drops AXUIElement
+```
