@@ -8,8 +8,8 @@
 
 This document walks through building a Mac automation bridge where:
 
-- **TypeScript (Deno)** is the agent orchestrator — it runs the LLM loop,
-  decides what to do, and calls into native code for every macOS interaction.
+- **TypeScript (Deno)** is the agent client — it issues commands to interact
+  with macOS, calling into native code for every OS interaction.
 - **Rust** is the native layer — a compiled `cdylib` that links against macOS
   frameworks (Accessibility, CoreGraphics, AppKit) and exposes a C ABI.
 - **Deno.dlopen** is the glue — Deno's built-in FFI mechanism loads the Rust
@@ -26,7 +26,7 @@ In Casper's stack this looks like:
 
 ```
 TypeScript  ──Deno.dlopen──▶  C ABI  ◀──extern "C"──  Rust
-  (agent)                   (contract)              (native)
+  (client)                  (contract)              (native)
 ```
 
 - **Rust** compiles to a `.dylib` (dynamic library) with `extern "C"` entry
@@ -48,7 +48,7 @@ granted to the Deno process apply to the Rust code automatically.
 ┌──────────────────────────────────────────────────────────────┐
 │  Deno Process                                                │
 │                                                              │
-│  agent.ts  ─── orchestrator / LLM loop                      │
+│  client.ts ─── agent client / TS command interface           │
 │    ↓                                                         │
 │  mac-bridge.ts  ─── typed wrappers around FFI symbols        │
 │    ↓                                                         │
@@ -94,7 +94,7 @@ granted to the Deno process apply to the Rust code automatically.
   at any `.dylib` that exports C functions and get callable TypeScript
   symbols immediately.
 - **Built-in TypeScript** — Deno runs `.ts` files directly with top-level
-  await, a permissions model, and a standard library. The agent loop is
+  await, a permissions model, and a standard library. The client code is
   plain TypeScript with zero build step.
 - **Minimal Rust surface** — the Rust side only needs `extern "C"` +
   `#[no_mangle]` and `cargo build`. No codegen, no binding macros, no
@@ -180,7 +180,7 @@ mac-bridge/
     ├── deno.json           # Deno project config
     ├── mod.ts              # main entry — Deno.dlopen + symbol defs
     ├── mac_bridge.ts       # high-level typed API
-    └── agent.ts            # example agent loop
+    └── client.ts           # example agent client
 ```
 
 ### Cargo.toml
@@ -1074,12 +1074,12 @@ export function close(): void {
 
 ---
 
-## Part 5: Agent Usage Example
+## Part 5: Agent Client Usage Example
 
 ```typescript
-// deno/agent.ts — example agent loop
+// deno/client.ts — example agent client issuing OS commands
 //
-// Run: deno run --allow-ffi --allow-write agent.ts
+// Run: deno run --allow-ffi --allow-write client.ts
 
 import {
   checkPermissions,
@@ -1096,7 +1096,7 @@ import {
   close,
 } from "./mac_bridge.ts";
 
-async function agentLoop() {
+async function main() {
   // 1. Check permissions on startup
   const perms = checkPermissions();
   console.log("Permissions:", perms);
@@ -1125,8 +1125,7 @@ async function agentLoop() {
     }
   }
 
-  // 5. Interact
-  // (Your LLM decides what to do based on the screenshot)
+  // 5. Issue OS commands via the TS API
   // click({ x: 500, y: 300 });
   // typeText("hello world");
   // hotkey("cmd+s");
@@ -1135,7 +1134,7 @@ async function agentLoop() {
   close();
 }
 
-agentLoop();
+main();
 ```
 
 ### deno.json
@@ -1144,8 +1143,8 @@ agentLoop();
 {
   "tasks": {
     "build": "cargo build --release",
-    "agent": "deno run --allow-ffi --allow-write --allow-read deno/agent.ts",
-    "dev": "cargo build && deno run --allow-ffi --allow-write --allow-read deno/agent.ts"
+    "client": "deno run --allow-ffi --allow-write --allow-read deno/client.ts",
+    "dev": "cargo build && deno run --allow-ffi --allow-write --allow-read deno/client.ts"
   },
   "compilerOptions": {
     "strict": true
@@ -1160,11 +1159,11 @@ agentLoop();
 cargo build --release
 # Produces: target/release/libmacbridge.dylib
 
-# Run the agent
-deno run --allow-ffi --allow-write --allow-read deno/agent.ts
+# Run the client
+deno run --allow-ffi --allow-write --allow-read deno/client.ts
 
 # Or use the task shortcut
-deno task agent
+deno task client
 ```
 
 ---
