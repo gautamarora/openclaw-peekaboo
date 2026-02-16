@@ -1,9 +1,8 @@
 # Casper: Entity-Based Mac Automation
 
-Casper is an entity-oriented TypeScript API for macOS desktop automation,
-backed by Rust FFI to native macOS frameworks. Instead of flat function
-calls (`click(x, y)`, `listWindows(pid)`), everything is expressed as
-`Entity.action()`.
+Casper is a TypeScript API for macOS desktop automation, backed by Rust FFI.
+Instead of flat function calls (`click(x, y)`, `listWindows(pid)`), everything
+is an entity with methods: `App`, `Window`, `Element`, `Keyboard`.
 
 ```typescript
 const safari = await App.launch("com.apple.Safari");
@@ -21,221 +20,131 @@ const screenshot = await Screen.capture();
 await Deno.writeFile("/tmp/screen.png", screenshot);
 ```
 
+---
+
 ## Entity Hierarchy
 
 ```
-Casper (root)
-├── Screen
-│   ├── .capture() → Uint8Array
-│   ├── .captureArea(rect) → Uint8Array
-│   └── .displays() → Display[]
-│
+Casper
 ├── App
 │   ├── .launch(bundleId) → App          (static)
 │   ├── .frontmost() → App               (static)
 │   ├── .all() → App[]                   (static)
 │   ├── .find(name | bundleId) → App     (static)
-│   │
-│   ├── .pid → number
-│   ├── .name → string
-│   ├── .bundleId → string
-│   ├── .activate()
-│   ├── .quit(force?)
-│   ├── .hide()
-│   ├── .unhide()
+│   ├── .pid, .name, .bundleId
+│   ├── .activate(), .quit(), .hide()
 │   ├── .windows() → Window[]
 │   ├── .focusedWindow() → Window
-│   ├── .menu(path) → MenuItem
-│   ├── .menus() → MenuItem[]
-│   └── .isRunning → boolean
+│   └── .menu(path), .menus()
 │
 ├── Window
-│   ├── .focus()
-│   ├── .close()
-│   ├── .minimize()
-│   ├── .maximize()
-│   ├── .move(point)
-│   ├── .resize(size)
-│   ├── .bounds() → Rect
+│   ├── .focus(), .close(), .minimize(), .maximize()
+│   ├── .move(point), .resize(size), .bounds()
 │   ├── .capture() → Uint8Array
-│   ├── .app → App
-│   ├── .title → string
-│   ├── .id → number
+│   ├── .title, .id, .app
 │   ├── .findAll(query) → Element[]
 │   ├── .find(query) → Element | null
 │   ├── .waitFor(query, timeout?) → Element
-│   ├── .findInPage(query) → Element[]
-│   ├── .waitForInPage(query, timeout?) → Element
 │   └── .snapshot(opts?) → Snapshot
 │
-├── Element (AX UI element)
-│   ├── .role → string
-│   ├── .title → string | null
-│   ├── .label → string | null
-│   ├── .value → string | null
-│   ├── .bounds → Rect
-│   ├── .isEnabled → boolean
-│   │
-│   ├── .click()
-│   ├── .doubleClick()
-│   ├── .rightClick()
-│   ├── .focus()
-│   ├── .type(text)
-│   ├── .clear()
-│   ├── .press(action)          → AXPress, AXConfirm, etc.
-│   ├── .scrollTo()
-│   │
-│   ├── .parent() → Element
-│   ├── .children() → Element[]
-│   ├── .findAll(query) → Element[]
-│   └── .find(query) → Element | null
+├── Element
+│   ├── .role, .title, .label, .value, .bounds
+│   ├── .click(), .doubleClick(), .rightClick()
+│   ├── .type(text), .clear(), .focus()
+│   ├── .parent(), .children()
+│   └── .findAll(query), .find(query)
 │
-├── Browser (extends App)
-│   ├── .open(bundleId?) → Browser       (static, defaults to default browser)
-│   ├── .tabs() → Tab[]
-│   ├── .activeTab() → Tab
-│   └── .newTab(url?) → Tab
-│
-├── Tab (browser tab)
-│   ├── .url → string
-│   ├── .title → string
-│   ├── .navigate(url)
-│   ├── .reload()
-│   ├── .close()
-│   ├── .activate()
-│   └── .window → Window
-│
-├── Finder (extends App)
-│   ├── .open(path?) → Finder            (static)
-│   ├── .selectedFiles() → File[]
-│   ├── .currentFolder() → string
-│   ├── .navigate(path)
-│   └── .reveal(path) → File
-│
-├── File
-│   ├── .path → string
-│   ├── .name → string
-│   ├── .open()
-│   ├── .openWith(appBundleId)
-│   ├── .reveal()                         → show in Finder
-│   ├── .trash()
-│   ├── .copyTo(dest)
-│   └── .moveTo(dest)
-│
-├── Keyboard
-│   ├── .type(text, opts?)
-│   ├── .hotkey(keys)
-│   ├── .press(key)
-│   ├── .keyDown(key)
-│   └── .keyUp(key)
-│
-├── Mouse
-│   ├── .click(point, opts?)
-│   ├── .doubleClick(point)
-│   ├── .rightClick(point)
-│   ├── .move(point)
-│   ├── .drag(from, to, opts?)
-│   ├── .scroll(direction, amount?)
-│   └── .position() → Point
-│
-├── Clipboard
-│   ├── .read() → string
-│   ├── .write(text)
-│   ├── .readImage() → Uint8Array | null
-│   └── .clear()
-│
-├── Dialog (active system dialog)
-│   ├── .find(opts?) → Dialog | null      (static)
-│   ├── .title → string
-│   ├── .buttons() → Element[]
-│   ├── .textFields() → Element[]
-│   ├── .clickButton(name)
-│   ├── .enterText(text, field?)
-│   └── .dismiss()
-│
-├── Menu
-│   ├── .click(path)                      → "File > Save As..."
-│   └── .items() → MenuItem[]
-│
-├── Snapshot (AX tree → text + handles)
-│   ├── .text → string
-│   ├── .refs → Map<number, Element>
-│   ├── .click(ref) → void
-│   ├── .type(ref, text) → void
-│   ├── .get(ref) → Element
+├── Snapshot
+│   ├── .text → string                   (compact AX tree with [ref=N] tags)
+│   ├── .refs → Map<number, Element>     (ref → live handle)
+│   ├── .click(ref), .type(ref, text)
 │   └── .dispose()
 │
-├── Permissions
-│   ├── .check() → PermissionsStatus
-│   ├── .accessibility → boolean
-│   └── .screenRecording → boolean
+├── Keyboard                             (stateless)
+│   ├── .type(text), .hotkey(keys), .press(key)
+│   └── .keyDown(key), .keyUp(key)
 │
-└── Script (AppleScript / OSA)
-    ├── .tell(app, command, opts?) → string  (static)
-    ├── .eval(source) → Record              (static)
-    └── .canScript(app) → boolean           (static)
+├── Mouse                                (stateless)
+│   ├── .click(point), .doubleClick(point), .rightClick(point)
+│   ├── .move(point), .drag(from, to)
+│   └── .scroll(direction, amount?)
+│
+├── Screen                               (stateless)
+│   └── .capture(displayId?) → Uint8Array
+│
+├── Clipboard                            (stateless)
+│   ├── .read(), .write(text), .clear()
+│   └── .readImage() → Uint8Array | null
+│
+├── Script                               (stateless — runs AppleScript)
+│   ├── .tell(app, command) → string
+│   ├── .eval(source) → Record
+│   └── .canScript(app) → boolean
+│
+└── Permissions
+    ├── .check() → PermissionsStatus
+    ├── .accessibility → boolean
+    └── .screenRecording → boolean
 ```
+
+Entities that hold state (App, Window, Element) have handles backed by live
+Rust-side objects. Stateless entities (Keyboard, Mouse, Screen, Clipboard,
+Script) are global singletons that call macOS APIs directly.
+
+---
 
 ## Design Principles
 
 ### 1. Entities hold handles, not data
 
-Each entity instance holds a **handle** — an opaque numeric ID that maps
-to a Rust-side object (an `AXUIElement`, a PID, a window ID, etc.). The
-handle stays valid until explicitly released.
+Each stateful entity holds a **handle** — an opaque numeric ID mapping to a
+Rust-side object (an `AXUIElement`, a PID, a window ID). The handle stays
+valid until explicitly released.
 
 ```typescript
-// App holds a PID
 const safari = await App.find("Safari");
-safari.pid;        // 12345
+safari._handle;       // 1 — points to a live AXUIElement in Rust
 
-// Window holds a CGWindowID + AX element handle
 const win = (await safari.windows())[0];
-win.id;            // 9001 (CGWindowID)
-win._handle;       // 42 (Rust handle table index)
+win._handle;          // 2
 
-// Element holds an AX element handle
 const btn = await win.find({ role: "AXButton", title: "OK" });
-btn._handle;       // 43 (Rust handle table index)
-await btn.click(); // calls Rust with handle 43
+btn._handle;          // 3
+await btn.click();    // Rust reads btn's CURRENT position, clicks it
 ```
+
+Without handles, every operation re-walks the AX tree and returns stale
+coordinate snapshots. With handles, Rust holds a live reference and reads
+the element's current position at action time.
 
 ### 2. Queries, not raw coordinates
 
-Elements are found by **query objects**, not screen coordinates. The query
-matches against AX attributes:
+Elements are found by query objects, not screen coordinates:
 
 ```typescript
 interface ElementQuery {
-  role?: string;          // "AXButton", "AXTextField", "AXLink"
-  title?: string;         // exact match
-  titleContains?: string; // substring
-  label?: string;         // AXDescription
-  value?: string;         // AXValue
-  identifier?: string;    // AXIdentifier
-  enabled?: boolean;      // filter by enabled state
+  role?: string;           // "AXButton", "AXTextField"
+  title?: string;          // exact match
+  titleContains?: string;  // substring
+  label?: string;          // AXDescription
+  value?: string;
+  identifier?: string;     // AXIdentifier
+  enabled?: boolean;
 }
 
-// Find all enabled buttons
-const buttons = await win.findAll({ role: "AXButton", enabled: true });
-
-// Find a specific text field
 const email = await win.find({ role: "AXTextField", label: "Email" });
-
-// Wait for an element to appear (polls AX tree)
+const buttons = await win.findAll({ role: "AXButton", enabled: true });
 const spinner = await win.waitFor({ role: "AXBusyIndicator" }, 5000);
 ```
 
 ### 3. Actions are async
 
-All actions that touch macOS APIs are `async`. This keeps the Deno event
-loop responsive and allows using `nonblocking: true` in `Deno.dlopen` for
-operations that might be slow (AX tree walks, screen capture).
+All macOS API calls are `async`. This keeps the Deno event loop responsive.
 
-### 4. Using blocks for disposable contexts
+### 4. Disposable handles
 
-Entities that hold handles should be disposable. Using `Deno.Disposable`
-(`using` keyword) or explicit `.dispose()`:
+Entities that hold handles implement `Disposable`. Use `using` blocks or
+explicit `.dispose()`:
 
 ```typescript
 {
@@ -243,8 +152,7 @@ Entities that hold handles should be disposable. Using `Deno.Disposable`
   const win = (await app.windows())[0];
   const field = await win.find({ role: "AXTextArea" });
   await field.type("Hello from Casper");
-  await Keyboard.hotkey("cmd+s");
-} // app handle released, AX element handles freed
+} // handles released
 ```
 
 ---
@@ -252,63 +160,33 @@ Entities that hold handles should be disposable. Using `Deno.Disposable`
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  Deno — TypeScript                                           │
-│                                                              │
-│  ┌─────────────────────────────────────────┐                 │
-│  │  Entity Layer (casper/)                 │                 │
-│  │                                         │                 │
-│  │  App  Window  Element  Browser  Finder  │                 │
-│  │  Mouse  Keyboard  Screen  Clipboard     │                 │
-│  │  Dialog  File  Tab  Menu                │                 │
-│  └──────────────┬──────────────────────────┘                 │
-│                 │ calls                                       │
-│  ┌──────────────▼──────────────────────────┐                 │
-│  │  FFI Bridge (casper/ffi/)               │                 │
-│  │                                         │                 │
-│  │  ffi.ts       — Deno.dlopen symbols     │                 │
-│  │  handles.ts   — handle lifecycle mgmt   │                 │
-│  │  helpers.ts   — pointer/buffer utils    │                 │
-│  └──────────────┬──────────────────────────┘                 │
-│                 │ Deno.dlopen                                 │
-└─────────────────┼────────────────────────────────────────────┘
-                  │
-┌─────────────────▼────────────────────────────────────────────┐
-│  Rust — libcasper.dylib                                      │
-│                                                              │
-│  ┌─────────────────────────────────────────┐                 │
-│  │  FFI Surface (ffi.rs)                   │                 │
-│  │                                         │                 │
-│  │  casper_* extern "C" functions          │                 │
-│  │  Handle-based dispatch                  │                 │
-│  └──────────────┬──────────────────────────┘                 │
-│                 │                                             │
-│  ┌──────────────▼──────────────────────────┐                 │
-│  │  Handle Table (handles.rs)              │                 │
-│  │                                         │                 │
-│  │  HashMap<u64, HandleEntry>              │                 │
-│  │  Tracks: AXElements, PIDs, WindowIDs    │                 │
-│  │  Ref-counted, thread-safe               │                 │
-│  └──────────────┬──────────────────────────┘                 │
-│                 │                                             │
-│  ┌──────────────▼──────────────────────────┐                 │
-│  │  Core Modules                           │                 │
-│  │                                         │                 │
-│  │  ax.rs   input.rs   capture.rs          │                 │
-│  │  apps.rs  clipboard.rs  permissions.rs  │                 │
-│  └─────────────────────────────────────────┘                 │
-│                 │                                             │
-│                 ▼                                             │
-│  macOS: ApplicationServices, CoreGraphics, AppKit            │
-└──────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────┐
+│  Deno (TypeScript)                                   │
+│                                                      │
+│  App  Window  Element  Keyboard  Mouse  Screen  ... │
+│                    │                                  │
+│              FFI (Deno.dlopen)                        │
+└────────────────────┼─────────────────────────────────┘
+                     │
+┌────────────────────▼─────────────────────────────────┐
+│  Rust (libcasper.dylib)                               │
+│                                                      │
+│  ffi.rs  ←  handles.rs  ←  ax.rs, input.rs, ...     │
+│                                                      │
+│  macOS: ApplicationServices, CoreGraphics, AppKit    │
+└──────────────────────────────────────────────────────┘
 ```
+
+The FFI boundary uses `extern "C"` functions. Stateful operations take a
+handle ID (`u64`), look it up in the handle table, and operate on the live
+object. Stateless operations (keyboard, mouse, screen) take raw values.
+
+Returns use a pointer+length pattern: Rust allocates a buffer, writes JSON
+or PNG bytes, returns the pointer and length. Deno reads and then frees.
 
 ---
 
 ## Rust: Handle Table
-
-The central design change from the flat FFI approach. The Rust side maintains
-a table of live objects that Deno holds references to.
 
 ```rust
 // handles.rs
@@ -321,134 +199,70 @@ static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 static HANDLE_TABLE: Mutex<Option<HashMap<u64, HandleEntry>>> = Mutex::new(None);
 
 pub enum HandleEntry {
-    /// An AXUIElement reference (for windows, elements, menus)
     AXElement(crate::ax::AXElement),
-
-    /// An application (PID + AXUIElement for the app)
-    App {
-        pid: i32,
-        bundle_id: String,
-        name: String,
-        ax: crate::ax::AXElement,
-    },
-
-    /// A window (CGWindowID + AX element + owning app PID)
-    Window {
-        window_id: u32,
-        pid: i32,
-        ax: crate::ax::AXElement,
-    },
+    App { pid: i32, bundle_id: String, name: String, ax: crate::ax::AXElement },
+    Window { window_id: u32, pid: i32, ax: crate::ax::AXElement },
 }
 
-fn table() -> std::sync::MutexGuard<'static, Option<HashMap<u64, HandleEntry>>> {
-    let mut guard = HANDLE_TABLE.lock().unwrap();
-    if guard.is_none() {
-        *guard = Some(HashMap::new());
-    }
-    guard
-}
-
-/// Insert a new entry, return its handle ID.
 pub fn insert(entry: HandleEntry) -> u64 {
     let id = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
     table().as_mut().unwrap().insert(id, entry);
     id
 }
 
-/// Get a reference to an entry by handle.
-pub fn get(handle: u64) -> Option<std::sync::MutexGuard<'static, Option<HashMap<u64, HandleEntry>>>> {
-    let guard = table();
-    if guard.as_ref().unwrap().contains_key(&handle) {
-        Some(guard)
-    } else {
-        None
-    }
-}
-
-/// Remove and drop an entry.
 pub fn release(handle: u64) {
     table().as_mut().unwrap().remove(&handle);
 }
 
-/// Release all handles (cleanup).
 pub fn release_all() {
     table().as_mut().unwrap().clear();
 }
-```
 
-### Why handles matter
-
-Without handles, every operation requires re-querying the AX tree:
-
-```typescript
-// BAD: re-walks the tree every call
-const buttons = await mac_find_elements_by_role(pid, "AXButton", 10);
-// Returns JSON snapshots — the elements are gone. You get data, not references.
-// To click, you need coordinates. If the UI shifted, coordinates are stale.
-```
-
-With handles, the Rust side holds a live `AXUIElement` reference:
-
-```typescript
-// GOOD: holds a reference
-const btn = await win.find({ role: "AXButton", title: "OK" });
-// btn._handle = 43, pointing at a live AXUIElement in Rust
-
-// Can query its *current* position at click time
-await btn.click();
-// Rust: reads btn's current frame from AX, clicks center of it
-// Works even if the UI moved since the query
+fn table() -> std::sync::MutexGuard<'static, Option<HashMap<u64, HandleEntry>>> {
+    let mut guard = HANDLE_TABLE.lock().unwrap();
+    if guard.is_none() { *guard = Some(HashMap::new()); }
+    guard
+}
 ```
 
 ---
 
-## Rust: Handle-Based FFI Surface
+## Rust: FFI Surface
+
+The complete `extern "C"` interface. Handle-based operations look up the
+handle and dispatch to core modules. Stateless operations call core modules
+directly.
 
 ```rust
-// ffi.rs — Casper's extern "C" surface, handle-oriented
+// ffi.rs
 
 use crate::handles;
 use std::ptr;
 
-// ================================================================
-// Buffer helpers (same as before)
-// ================================================================
+// --- Buffer helpers ---
 
 #[unsafe(no_mangle)]
 pub extern "C" fn casper_free_buffer(ptr: *mut u8, len: u64) { /* ... */ }
-
 fn vec_to_ffi(data: Vec<u8>, out_len: *mut u64) -> *mut u8 { /* ... */ }
 fn json_to_ffi<T: serde::Serialize>(value: &T, out_len: *mut u64) -> *mut u8 { /* ... */ }
 unsafe fn str_from_buf(ptr: *const u8, len: u32) -> &'static str { /* ... */ }
 
-// ================================================================
-// Lifecycle
-// ================================================================
+// --- Lifecycle ---
 
-/// Release a handle. Frees the Rust-side object.
 #[unsafe(no_mangle)]
-pub extern "C" fn casper_release(handle: u64) {
-    handles::release(handle);
-}
+pub extern "C" fn casper_release(handle: u64) { handles::release(handle); }
 
-/// Release all handles. Call on shutdown.
 #[unsafe(no_mangle)]
-pub extern "C" fn casper_release_all() {
-    handles::release_all();
-}
+pub extern "C" fn casper_release_all() { handles::release_all(); }
 
-// ================================================================
-// App
-// ================================================================
+// --- App ---
 
-/// List all running GUI apps. Returns JSON array, each with a `handle` field.
-/// Each app is inserted into the handle table.
+/// List all running GUI apps. Returns JSON array, each with a handle field.
 #[unsafe(no_mangle)]
 pub extern "C" fn casper_app_all(out_len: *mut u64) -> *mut u8 {
     let apps = crate::apps::list_applications();
     let result: Vec<serde_json::Value> = apps.into_iter().map(|app| {
         let ax = crate::ax::application(app.pid);
-        ax.set_timeout(10.0);
         let handle = handles::insert(handles::HandleEntry::App {
             pid: app.pid,
             bundle_id: app.bundle_id.clone().unwrap_or_default(),
@@ -456,255 +270,54 @@ pub extern "C" fn casper_app_all(out_len: *mut u64) -> *mut u8 {
             ax,
         });
         serde_json::json!({
-            "handle": handle,
-            "pid": app.pid,
-            "bundleId": app.bundle_id,
-            "name": app.name,
-            "isActive": app.is_active,
-            "isHidden": app.is_hidden,
+            "handle": handle, "pid": app.pid,
+            "bundleId": app.bundle_id, "name": app.name,
         })
     }).collect();
     json_to_ffi(&result, out_len)
 }
 
-/// Get the frontmost app. Returns JSON with handle.
 #[unsafe(no_mangle)]
-pub extern "C" fn casper_app_frontmost(out_len: *mut u64) -> *mut u8 {
-    match crate::apps::frontmost_application() {
-        Some(app) => {
-            let ax = crate::ax::application(app.pid);
-            ax.set_timeout(10.0);
-            let handle = handles::insert(handles::HandleEntry::App {
-                pid: app.pid,
-                bundle_id: app.bundle_id.clone().unwrap_or_default(),
-                name: app.name.clone().unwrap_or_default(),
-                ax,
-            });
-            let value = serde_json::json!({
-                "handle": handle,
-                "pid": app.pid,
-                "bundleId": app.bundle_id,
-                "name": app.name,
-            });
-            json_to_ffi(&value, out_len)
-        }
-        None => { unsafe { *out_len = 0; } ptr::null_mut() }
-    }
-}
+pub extern "C" fn casper_app_frontmost(out_len: *mut u64) -> *mut u8 { /* ... */ }
 
-/// Launch an app by bundle ID. Returns JSON with handle.
 #[unsafe(no_mangle)]
 pub extern "C" fn casper_app_launch(
-    bundle_id: *const u8, bundle_id_len: u32,
-    out_len: *mut u64,
-) -> *mut u8 {
-    let id = unsafe { str_from_buf(bundle_id, bundle_id_len) };
-    if crate::apps::launch_app(id).is_err() {
-        unsafe { *out_len = 0; }
-        return ptr::null_mut();
-    }
-    // Wait briefly for launch, then query
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    casper_app_find(bundle_id, bundle_id_len, out_len)
-}
+    bundle_id: *const u8, bundle_id_len: u32, out_len: *mut u64,
+) -> *mut u8 { /* ... */ }
 
-/// Find a running app by bundle ID or name. Returns JSON with handle.
 #[unsafe(no_mangle)]
 pub extern "C" fn casper_app_find(
-    query: *const u8, query_len: u32,
-    out_len: *mut u64,
-) -> *mut u8 {
-    let q = unsafe { str_from_buf(query, query_len) };
-    let apps = crate::apps::list_applications();
-    let found = apps.into_iter().find(|a| {
-        a.bundle_id.as_deref() == Some(q)
-            || a.name.as_deref().map(|n| n.eq_ignore_ascii_case(q)).unwrap_or(false)
-    });
-    match found {
-        Some(app) => {
-            let ax = crate::ax::application(app.pid);
-            ax.set_timeout(10.0);
-            let handle = handles::insert(handles::HandleEntry::App {
-                pid: app.pid,
-                bundle_id: app.bundle_id.clone().unwrap_or_default(),
-                name: app.name.clone().unwrap_or_default(),
-                ax,
-            });
-            let value = serde_json::json!({
-                "handle": handle,
-                "pid": app.pid,
-                "bundleId": app.bundle_id,
-                "name": app.name,
-            });
-            json_to_ffi(&value, out_len)
-        }
-        None => { unsafe { *out_len = 0; } ptr::null_mut() }
-    }
-}
+    query: *const u8, query_len: u32, out_len: *mut u64,
+) -> *mut u8 { /* ... */ }
 
-/// Activate an app by handle. Returns 0 on success.
 #[unsafe(no_mangle)]
-pub extern "C" fn casper_app_activate(handle: u64) -> i32 {
-    let table = handles::table();
-    let map = table.as_ref().unwrap();
-    match map.get(&handle) {
-        Some(handles::HandleEntry::App { bundle_id, .. }) => {
-            match crate::apps::activate_app(bundle_id) {
-                Ok(()) => 0,
-                Err(_) => -1,
-            }
-        }
-        _ => -1,
-    }
-}
+pub extern "C" fn casper_app_activate(handle: u64) -> i32 { /* ... */ }
 
-/// Quit an app by handle. force: 0=graceful, 1=force.
 #[unsafe(no_mangle)]
-pub extern "C" fn casper_app_quit(handle: u64, force: u8) -> i32 {
-    let table = handles::table();
-    let map = table.as_ref().unwrap();
-    match map.get(&handle) {
-        Some(handles::HandleEntry::App { bundle_id, .. }) => {
-            match crate::apps::quit_app(bundle_id, force != 0) {
-                Ok(_) => { drop(table); handles::release(handle); 0 }
-                Err(_) => -1,
-            }
-        }
-        _ => -1,
-    }
-}
+pub extern "C" fn casper_app_quit(handle: u64, force: u8) -> i32 { /* ... */ }
 
-/// Get windows for an app handle. Returns JSON array with window handles.
 #[unsafe(no_mangle)]
-pub extern "C" fn casper_app_windows(handle: u64, out_len: *mut u64) -> *mut u8 {
-    let table = handles::table();
-    let map = table.as_ref().unwrap();
-    match map.get(&handle) {
-        Some(handles::HandleEntry::App { pid, ax, .. }) => {
-            let windows = ax.windows();
-            let result: Vec<serde_json::Value> = windows.into_iter().map(|w| {
-                let title = w.title();
-                let (x, y, width, height) = w.frame().unwrap_or((0.0, 0.0, 0.0, 0.0));
-                let win_handle = handles::insert(handles::HandleEntry::Window {
-                    window_id: 0, // resolved via AXWindowResolver if needed
-                    pid: *pid,
-                    ax: w,
-                });
-                serde_json::json!({
-                    "handle": win_handle,
-                    "title": title,
-                    "bounds": { "x": x, "y": y, "width": width, "height": height },
-                })
-            }).collect();
-            json_to_ffi(&result, out_len)
-        }
-        _ => { unsafe { *out_len = 0; } ptr::null_mut() }
-    }
-}
+pub extern "C" fn casper_app_windows(handle: u64, out_len: *mut u64) -> *mut u8 { /* ... */ }
 
-// ================================================================
-// Window
-// ================================================================
+// --- Window ---
 
-/// Focus a window by handle.
 #[unsafe(no_mangle)]
-pub extern "C" fn casper_window_focus(handle: u64) -> i32 {
-    let table = handles::table();
-    let map = table.as_ref().unwrap();
-    match map.get(&handle) {
-        Some(handles::HandleEntry::Window { ax, .. }) => {
-            match ax.perform_action("AXRaise") {
-                Ok(()) => 0,
-                Err(_) => -1,
-            }
-        }
-        _ => -1,
-    }
-}
+pub extern "C" fn casper_window_focus(handle: u64) -> i32 { /* ... */ }
 
-/// Close a window by handle.
 #[unsafe(no_mangle)]
-pub extern "C" fn casper_window_close(handle: u64) -> i32 {
-    // Press the close button via AX
-    let table = handles::table();
-    let map = table.as_ref().unwrap();
-    match map.get(&handle) {
-        Some(handles::HandleEntry::Window { ax, .. }) => {
-            // AXCloseButton attribute → perform AXPress
-            if let Some(btn) = ax.ax_attr_element("AXCloseButton") {
-                match btn.perform_action("AXPress") {
-                    Ok(()) => 0,
-                    Err(_) => -1,
-                }
-            } else { -1 }
-        }
-        _ => -1,
-    }
-}
+pub extern "C" fn casper_window_close(handle: u64) -> i32 { /* ... */ }
 
-/// Capture a window as PNG by handle. Returns bytes pointer.
 #[unsafe(no_mangle)]
-pub extern "C" fn casper_window_capture(handle: u64, out_len: *mut u64) -> *mut u8 {
-    let table = handles::table();
-    let map = table.as_ref().unwrap();
-    match map.get(&handle) {
-        Some(handles::HandleEntry::Window { window_id, .. }) if *window_id != 0 => {
-            match crate::capture::capture_window(*window_id) {
-                Ok(png) => vec_to_ffi(png, out_len),
-                Err(_) => { unsafe { *out_len = 0; } ptr::null_mut() }
-            }
-        }
-        _ => { unsafe { *out_len = 0; } ptr::null_mut() }
-    }
-}
+pub extern "C" fn casper_window_capture(handle: u64, out_len: *mut u64) -> *mut u8 { /* ... */ }
 
-/// Find elements within a window. query_json is a JSON ElementQuery.
-/// Returns JSON array of elements with handles.
 #[unsafe(no_mangle)]
 pub extern "C" fn casper_window_find_all(
-    handle: u64,
-    query_json: *const u8, query_len: u32,
-    out_len: *mut u64,
-) -> *mut u8 {
-    let query_str = unsafe { str_from_buf(query_json, query_len) };
-    let query: ElementQuery = match serde_json::from_str(query_str) {
-        Ok(q) => q,
-        Err(_) => { unsafe { *out_len = 0; } return ptr::null_mut(); }
-    };
+    handle: u64, query_json: *const u8, query_len: u32, out_len: *mut u64,
+) -> *mut u8 { /* ... */ }
 
-    let table = handles::table();
-    let map = table.as_ref().unwrap();
-    let ax = match map.get(&handle) {
-        Some(handles::HandleEntry::Window { ax, .. }) => ax,
-        _ => { unsafe { *out_len = 0; } return ptr::null_mut(); }
-    };
+// --- Element ---
 
-    let matches = ax.find_all(12, &|elem| query.matches(elem));
-
-    let result: Vec<serde_json::Value> = matches.into_iter().map(|e| {
-        let (x, y, w, h) = e.frame().unwrap_or((0.0, 0.0, 0.0, 0.0));
-        let role = e.role();
-        let title = e.title();
-        let label = e.label();
-        let value = e.value();
-        let elem_handle = handles::insert(handles::HandleEntry::AXElement(e));
-        serde_json::json!({
-            "handle": elem_handle,
-            "role": role,
-            "title": title,
-            "label": label,
-            "value": value,
-            "bounds": { "x": x, "y": y, "width": w, "height": h },
-        })
-    }).collect();
-    json_to_ffi(&result, out_len)
-}
-
-// ================================================================
-// Element
-// ================================================================
-
-/// Click an element by handle. Reads current position from AX.
+/// Click an element by handle. Reads current position from AX at click time.
 #[unsafe(no_mangle)]
 pub extern "C" fn casper_element_click(handle: u64, click_type: u8) -> i32 {
     let table = handles::table();
@@ -713,159 +326,91 @@ pub extern "C" fn casper_element_click(handle: u64, click_type: u8) -> i32 {
         Some(handles::HandleEntry::AXElement(ax)) => ax,
         _ => return -1,
     };
-
-    // Read the element's current frame from AX (not cached)
-    let (x, y, w, h) = match ax.frame() {
-        Some(f) => f,
-        None => return -1,
-    };
+    let (x, y, w, h) = match ax.frame() { Some(f) => f, None => return -1 };
     let center_x = x + w / 2.0;
     let center_y = y + h / 2.0;
-
-    drop(table); // release lock before input
-
-    let button = crate::input::MouseButton::Left;
-    let count = match click_type {
-        1 => 2, // double
-        2 => { // right click
-            return match crate::input::click(center_x, center_y,
-                crate::input::MouseButton::Right, 1) {
-                Ok(()) => 0, Err(_) => -1,
-            };
-        }
-        _ => 1, // single
-    };
-    match crate::input::click(center_x, center_y, button, count) {
-        Ok(()) => 0,
-        Err(_) => -1,
+    drop(table);
+    match crate::input::click(center_x, center_y, crate::input::MouseButton::Left, 1) {
+        Ok(()) => 0, Err(_) => -1,
     }
 }
 
-/// Type text into an element. Focuses it first via AXFocused.
 #[unsafe(no_mangle)]
 pub extern "C" fn casper_element_type(
-    handle: u64,
-    text: *const u8, text_len: u32,
-    delay_ms: u64,
-) -> i32 {
-    let text_str = unsafe { str_from_buf(text, text_len) };
+    handle: u64, text: *const u8, text_len: u32, delay_ms: u64,
+) -> i32 { /* ... */ }
 
-    // Focus the element first
-    {
-        let table = handles::table();
-        let map = table.as_ref().unwrap();
-        match map.get(&handle) {
-            Some(handles::HandleEntry::AXElement(ax)) => {
-                let _ = ax.perform_action("AXFocus");
-            }
-            _ => return -1,
-        }
-    }
-
-    // Brief pause for focus to take effect
-    std::thread::sleep(std::time::Duration::from_millis(50));
-
-    match crate::input::type_text(text_str, delay_ms) {
-        Ok(()) => 0,
-        Err(_) => -1,
-    }
-}
-
-/// Get current properties of an element. Returns JSON.
 #[unsafe(no_mangle)]
-pub extern "C" fn casper_element_props(handle: u64, out_len: *mut u64) -> *mut u8 {
-    let table = handles::table();
-    let map = table.as_ref().unwrap();
-    match map.get(&handle) {
-        Some(handles::HandleEntry::AXElement(ax)) => {
-            let (x, y, w, h) = ax.frame().unwrap_or((0.0, 0.0, 0.0, 0.0));
-            let value = serde_json::json!({
-                "role": ax.role(),
-                "title": ax.title(),
-                "label": ax.label(),
-                "value": ax.value(),
-                "bounds": { "x": x, "y": y, "width": w, "height": h },
-            });
-            json_to_ffi(&value, out_len)
-        }
-        _ => { unsafe { *out_len = 0; } ptr::null_mut() }
-    }
-}
+pub extern "C" fn casper_element_props(handle: u64, out_len: *mut u64) -> *mut u8 { /* ... */ }
 
-/// Find children of an element matching a query. Returns JSON with handles.
 #[unsafe(no_mangle)]
 pub extern "C" fn casper_element_find_all(
-    handle: u64,
-    query_json: *const u8, query_len: u32,
-    out_len: *mut u64,
-) -> *mut u8 {
-    // Same pattern as casper_window_find_all but scoped to element's subtree
-    // ...
-    todo!()
-}
+    handle: u64, query_json: *const u8, query_len: u32, out_len: *mut u64,
+) -> *mut u8 { /* ... */ }
 
-// ================================================================
-// Input (stateless — no handles)
-// ================================================================
+// --- Input (stateless) ---
 
 #[unsafe(no_mangle)]
-pub extern "C" fn casper_keyboard_type(
-    text: *const u8, text_len: u32, delay_ms: u64,
-) -> i32 { /* ... */ }
+pub extern "C" fn casper_keyboard_type(text: *const u8, text_len: u32, delay_ms: u64) -> i32 { /* ... */ }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn casper_keyboard_hotkey(
-    keys: *const u8, keys_len: u32, hold_ms: u64,
-) -> i32 { /* ... */ }
+pub extern "C" fn casper_keyboard_hotkey(keys: *const u8, keys_len: u32, hold_ms: u64) -> i32 { /* ... */ }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn casper_mouse_click(
-    x: f64, y: f64, button: u8, count: u32,
-) -> i32 { /* ... */ }
+pub extern "C" fn casper_mouse_click(x: f64, y: f64, button: u8, count: u32) -> i32 { /* ... */ }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn casper_mouse_move(x: f64, y: f64) -> i32 { /* ... */ }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn casper_mouse_drag(
-    from_x: f64, from_y: f64, to_x: f64, to_y: f64,
-    steps: u32, delay_ms: u64,
+    from_x: f64, from_y: f64, to_x: f64, to_y: f64, steps: u32, delay_ms: u64,
 ) -> i32 { /* ... */ }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn casper_mouse_scroll(dx: i32, dy: i32) -> i32 { /* ... */ }
 
-// ================================================================
-// Screen capture (stateless)
-// ================================================================
+// --- Screen, Clipboard, Permissions (stateless) ---
 
 #[unsafe(no_mangle)]
-pub extern "C" fn casper_screen_capture(
-    display_id: u32, out_len: *mut u64,
-) -> *mut u8 { /* ... */ }
-
-// ================================================================
-// Clipboard (stateless)
-// ================================================================
+pub extern "C" fn casper_screen_capture(display_id: u32, out_len: *mut u64) -> *mut u8 { /* ... */ }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn casper_clipboard_read(out_len: *mut u64) -> *mut u8 { /* ... */ }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn casper_clipboard_write(
-    text: *const u8, text_len: u32,
-) -> i32 { /* ... */ }
-
-// ================================================================
-// Permissions (stateless)
-// ================================================================
+pub extern "C" fn casper_clipboard_write(text: *const u8, text_len: u32) -> i32 { /* ... */ }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn casper_permissions_check(out_len: *mut u64) -> *mut u8 { /* ... */ }
 
-// ================================================================
-// ElementQuery — used by find operations
-// ================================================================
+// --- AppleScript ---
+
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_script_tell(
+    app: *const u8, app_len: u32,
+    command: *const u8, command_len: u32,
+    launch_if_needed: u8,
+    out_len: *mut u64,
+) -> *mut u8 { /* ... */ }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_script_eval(
+    source: *const u8, source_len: u32, out_len: *mut u64,
+) -> *mut u8 { /* ... */ }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_script_can_script(app: *const u8, app_len: u32) -> u8 { /* ... */ }
+
+// --- Snapshots ---
+
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_window_snapshot(
+    handle: u64, max_depth: u32, web_only: u8, include_bounds: u8,
+    out_len: *mut u64,
+) -> *mut u8 { /* ... */ }
+
+// --- ElementQuery ---
 
 #[derive(serde::Deserialize)]
 struct ElementQuery {
@@ -896,10 +441,7 @@ impl ElementQuery {
         if let Some(ref label) = self.label {
             if elem.label().as_deref() != Some(label.as_str()) { return false; }
         }
-        if let Some(ref value) = self.value {
-            if elem.value().as_deref() != Some(value.as_str()) { return false; }
-        }
-        // identifier, enabled checks...
+        // ... value, identifier, enabled
         true
     }
 }
@@ -909,21 +451,15 @@ impl ElementQuery {
 
 ## TypeScript: Entity Classes
 
-### casper/ffi/symbols.ts — Deno.dlopen
+### FFI symbols
 
 ```typescript
-const LIB_PATH = new URL(
-  "../../target/release/libcasper.dylib",
-  import.meta.url,
-);
-
-const lib = Deno.dlopen(LIB_PATH, {
-  // Lifecycle
+// casper/ffi/symbols.ts
+const lib = Deno.dlopen("./target/release/libcasper.dylib", {
   casper_free_buffer: { parameters: ["pointer", "u64"], result: "void" },
   casper_release: { parameters: ["u64"], result: "void" },
   casper_release_all: { parameters: [], result: "void" },
 
-  // App
   casper_app_all: { parameters: ["pointer"], result: "pointer" },
   casper_app_frontmost: { parameters: ["pointer"], result: "pointer" },
   casper_app_launch: { parameters: ["buffer", "u32", "pointer"], result: "pointer" },
@@ -932,58 +468,48 @@ const lib = Deno.dlopen(LIB_PATH, {
   casper_app_quit: { parameters: ["u64", "u8"], result: "i32" },
   casper_app_windows: { parameters: ["u64", "pointer"], result: "pointer" },
 
-  // Window
   casper_window_focus: { parameters: ["u64"], result: "i32" },
   casper_window_close: { parameters: ["u64"], result: "i32" },
   casper_window_capture: { parameters: ["u64", "pointer"], result: "pointer" },
   casper_window_find_all: { parameters: ["u64", "buffer", "u32", "pointer"], result: "pointer" },
+  casper_window_snapshot: { parameters: ["u64", "u32", "u8", "u8", "pointer"], result: "pointer" },
 
-  // Element
   casper_element_click: { parameters: ["u64", "u8"], result: "i32" },
   casper_element_type: { parameters: ["u64", "buffer", "u32", "u64"], result: "i32" },
   casper_element_props: { parameters: ["u64", "pointer"], result: "pointer" },
   casper_element_find_all: { parameters: ["u64", "buffer", "u32", "pointer"], result: "pointer" },
 
-  // Keyboard
   casper_keyboard_type: { parameters: ["buffer", "u32", "u64"], result: "i32" },
   casper_keyboard_hotkey: { parameters: ["buffer", "u32", "u64"], result: "i32" },
-
-  // Mouse
   casper_mouse_click: { parameters: ["f64", "f64", "u8", "u32"], result: "i32" },
   casper_mouse_move: { parameters: ["f64", "f64"], result: "i32" },
   casper_mouse_drag: { parameters: ["f64", "f64", "f64", "f64", "u32", "u64"], result: "i32" },
   casper_mouse_scroll: { parameters: ["i32", "i32"], result: "i32" },
-
-  // Screen
   casper_screen_capture: { parameters: ["u32", "pointer"], result: "pointer" },
-
-  // Clipboard
   casper_clipboard_read: { parameters: ["pointer"], result: "pointer" },
   casper_clipboard_write: { parameters: ["buffer", "u32"], result: "i32" },
-
-  // Permissions
   casper_permissions_check: { parameters: ["pointer"], result: "pointer" },
+  casper_script_tell: { parameters: ["buffer", "u32", "buffer", "u32", "u8", "pointer"], result: "pointer" },
+  casper_script_eval: { parameters: ["buffer", "u32", "pointer"], result: "pointer" },
+  casper_script_can_script: { parameters: ["buffer", "u32"], result: "u8" },
 });
 
 export default lib;
 export const sym = lib.symbols;
 ```
 
-### casper/ffi/handles.ts — Handle Lifecycle
+### Handle base class
 
 ```typescript
+// casper/ffi/handles.ts
 import { sym } from "./symbols.ts";
 
-/** Base class for any entity that holds a Rust handle. */
 export class Handle implements Disposable {
   readonly _handle: number;
   #released = false;
 
-  constructor(handle: number) {
-    this._handle = handle;
-  }
+  constructor(handle: number) { this._handle = handle; }
 
-  /** Release the Rust-side object. */
   dispose(): void {
     if (!this.#released) {
       sym.casper_release(BigInt(this._handle));
@@ -991,160 +517,102 @@ export class Handle implements Disposable {
     }
   }
 
-  /** For `using` keyword support. */
-  [Symbol.dispose](): void {
-    this.dispose();
-  }
+  [Symbol.dispose](): void { this.dispose(); }
 }
 ```
 
-### casper/entities/app.ts
+### App
 
 ```typescript
-import { sym } from "../ffi/symbols.ts";
-import { callJson, encodeStr, assertOk } from "../ffi/helpers.ts";
+// casper/entities/app.ts
 import { Handle } from "../ffi/handles.ts";
-import { Window } from "./window.ts";
-
-interface AppData {
-  handle: number;
-  pid: number;
-  bundleId: string | null;
-  name: string | null;
-  isActive?: boolean;
-  isHidden?: boolean;
-}
 
 export class App extends Handle {
   readonly pid: number;
   readonly bundleId: string;
   readonly name: string;
 
-  private constructor(data: AppData) {
+  private constructor(data: { handle: number; pid: number; bundleId: string; name: string }) {
     super(data.handle);
     this.pid = data.pid;
     this.bundleId = data.bundleId ?? "";
     this.name = data.name ?? "";
   }
 
-  // --- Static factories ---
-
   static async all(): Promise<App[]> {
-    const apps = callJson<AppData[]>((out) => sym.casper_app_all(out));
-    return (apps ?? []).map((d) => new App(d));
+    return (callJson<any[]>((out) => sym.casper_app_all(out)) ?? []).map((d) => new App(d));
   }
 
   static async frontmost(): Promise<App> {
-    const data = callJson<AppData>((out) => sym.casper_app_frontmost(out));
+    const data = callJson<any>((out) => sym.casper_app_frontmost(out));
     if (!data) throw new Error("No frontmost application");
     return new App(data);
   }
 
   static async find(query: string): Promise<App> {
     const [buf, len] = encodeStr(query);
-    const data = callJson<AppData>((out) =>
-      sym.casper_app_find(buf, len, out)
-    );
+    const data = callJson<any>((out) => sym.casper_app_find(buf, len, out));
     if (!data) throw new Error(`App not found: ${query}`);
     return new App(data);
   }
 
   static async launch(bundleId: string): Promise<App> {
     const [buf, len] = encodeStr(bundleId);
-    const data = callJson<AppData>((out) =>
-      sym.casper_app_launch(buf, len, out)
-    );
+    const data = callJson<any>((out) => sym.casper_app_launch(buf, len, out));
     if (!data) throw new Error(`Failed to launch: ${bundleId}`);
     return new App(data);
   }
 
-  // --- Instance methods ---
-
-  async activate(): Promise<void> {
-    assertOk(sym.casper_app_activate(BigInt(this._handle)), "activate");
-  }
-
-  async quit(force = false): Promise<void> {
-    assertOk(
-      sym.casper_app_quit(BigInt(this._handle), force ? 1 : 0),
-      "quit",
-    );
-  }
-
-  async hide(): Promise<void> {
-    // ... delegate to FFI
-  }
+  async activate(): Promise<void> { assertOk(sym.casper_app_activate(BigInt(this._handle)), "activate"); }
+  async quit(force = false): Promise<void> { assertOk(sym.casper_app_quit(BigInt(this._handle), force ? 1 : 0), "quit"); }
 
   async windows(): Promise<Window[]> {
-    const wins = callJson<Window.Data[]>((out) =>
-      sym.casper_app_windows(BigInt(this._handle), out)
-    );
-    return (wins ?? []).map((d) => new Window(d, this));
+    return (callJson<any[]>((out) => sym.casper_app_windows(BigInt(this._handle), out)) ?? [])
+      .map((d) => new Window(d, this));
   }
 
-  async focusedWindow(): Promise<Window> {
-    const wins = await this.windows();
-    return wins[0]; // first window is typically the focused one
-  }
+  async focusedWindow(): Promise<Window> { return (await this.windows())[0]; }
 }
 ```
 
-### casper/entities/window.ts
+### Window
 
 ```typescript
-import { sym } from "../ffi/symbols.ts";
-import { callJson, callBytes, encodeStr, assertOk } from "../ffi/helpers.ts";
+// casper/entities/window.ts
 import { Handle } from "../ffi/handles.ts";
 import { Element, type ElementQuery } from "./element.ts";
-import type { App } from "./app.ts";
-import type { Rect } from "../types.ts";
 
 export class Window extends Handle {
   readonly title: string;
   readonly app: App;
   readonly bounds: Rect;
 
-  /** @internal */
-  constructor(
-    data: { handle: number; title: string | null; bounds: Rect },
-    app: App,
-  ) {
+  constructor(data: { handle: number; title: string; bounds: Rect }, app: App) {
     super(data.handle);
     this.title = data.title ?? "";
     this.app = app;
     this.bounds = data.bounds;
   }
 
-  async focus(): Promise<void> {
-    assertOk(sym.casper_window_focus(BigInt(this._handle)), "focus");
-  }
-
-  async close(): Promise<void> {
-    assertOk(sym.casper_window_close(BigInt(this._handle)), "close");
-  }
+  async focus(): Promise<void> { assertOk(sym.casper_window_focus(BigInt(this._handle)), "focus"); }
+  async close(): Promise<void> { assertOk(sym.casper_window_close(BigInt(this._handle)), "close"); }
 
   async capture(): Promise<Uint8Array> {
-    const data = callBytes((out) =>
-      sym.casper_window_capture(BigInt(this._handle), out)
-    );
+    const data = callBytes((out) => sym.casper_window_capture(BigInt(this._handle), out));
     if (!data) throw new Error("Window capture failed");
     return data;
   }
 
   async findAll(query: ElementQuery): Promise<Element[]> {
     const [buf, len] = encodeStr(JSON.stringify(query));
-    const elements = callJson<Element.Data[]>((out) =>
-      sym.casper_window_find_all(BigInt(this._handle), buf, len, out)
-    );
-    return (elements ?? []).map((d) => new Element(d));
+    return (callJson<any[]>((out) => sym.casper_window_find_all(BigInt(this._handle), buf, len, out)) ?? [])
+      .map((d) => new Element(d));
   }
 
   async find(query: ElementQuery): Promise<Element | null> {
-    const all = await this.findAll(query);
-    return all[0] ?? null;
+    return (await this.findAll(query))[0] ?? null;
   }
 
-  /** Wait for an element matching the query to appear. Polls with timeout. */
   async waitFor(query: ElementQuery, timeoutMs = 5000): Promise<Element> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
@@ -1157,13 +625,11 @@ export class Window extends Handle {
 }
 ```
 
-### casper/entities/element.ts
+### Element
 
 ```typescript
-import { sym } from "../ffi/symbols.ts";
-import { callJson, encodeStr, assertOk } from "../ffi/helpers.ts";
+// casper/entities/element.ts
 import { Handle } from "../ffi/handles.ts";
-import type { Rect } from "../types.ts";
 
 export interface ElementQuery {
   role?: string;
@@ -1182,8 +648,7 @@ export class Element extends Handle {
   readonly value: string | null;
   readonly bounds: Rect;
 
-  /** @internal */
-  constructor(data: Element.Data) {
+  constructor(data: { handle: number; role: string; title: string; label: string; value: string; bounds: Rect }) {
     super(data.handle);
     this.role = data.role;
     this.title = data.title;
@@ -1192,159 +657,63 @@ export class Element extends Handle {
     this.bounds = data.bounds;
   }
 
-  /** Re-read current properties from the live AX element. */
-  async refresh(): Promise<Element.Props> {
-    return callJson<Element.Props>((out) =>
-      sym.casper_element_props(BigInt(this._handle), out)
-    )!;
+  async refresh(): Promise<{ role: string; title: string; label: string; value: string; bounds: Rect }> {
+    return callJson((out) => sym.casper_element_props(BigInt(this._handle), out))!;
   }
 
-  async click(): Promise<void> {
-    assertOk(sym.casper_element_click(BigInt(this._handle), 0), "click");
-  }
-
-  async doubleClick(): Promise<void> {
-    assertOk(sym.casper_element_click(BigInt(this._handle), 1), "doubleClick");
-  }
-
-  async rightClick(): Promise<void> {
-    assertOk(sym.casper_element_click(BigInt(this._handle), 2), "rightClick");
-  }
+  async click(): Promise<void> { assertOk(sym.casper_element_click(BigInt(this._handle), 0), "click"); }
+  async doubleClick(): Promise<void> { assertOk(sym.casper_element_click(BigInt(this._handle), 1), "doubleClick"); }
+  async rightClick(): Promise<void> { assertOk(sym.casper_element_click(BigInt(this._handle), 2), "rightClick"); }
 
   async type(text: string, delayMs = 50): Promise<void> {
     const [buf, len] = encodeStr(text);
-    assertOk(
-      sym.casper_element_type(BigInt(this._handle), buf, len, BigInt(delayMs)),
-      "type",
-    );
-  }
-
-  async children(): Promise<Element[]> {
-    const [buf, len] = encodeStr("{}"); // empty query = all children
-    const elements = callJson<Element.Data[]>((out) =>
-      sym.casper_element_find_all(BigInt(this._handle), buf, len, out)
-    );
-    return (elements ?? []).map((d) => new Element(d));
+    assertOk(sym.casper_element_type(BigInt(this._handle), buf, len, BigInt(delayMs)), "type");
   }
 
   async findAll(query: ElementQuery): Promise<Element[]> {
     const [buf, len] = encodeStr(JSON.stringify(query));
-    const elements = callJson<Element.Data[]>((out) =>
-      sym.casper_element_find_all(BigInt(this._handle), buf, len, out)
-    );
-    return (elements ?? []).map((d) => new Element(d));
+    return (callJson<any[]>((out) => sym.casper_element_find_all(BigInt(this._handle), buf, len, out)) ?? [])
+      .map((d) => new Element(d));
   }
 
   async find(query: ElementQuery): Promise<Element | null> {
-    const all = await this.findAll(query);
-    return all[0] ?? null;
-  }
-
-  toString(): string {
-    return `Element(${this.role} "${this.title ?? this.label ?? ""}")`;
-  }
-}
-
-export namespace Element {
-  export interface Data {
-    handle: number;
-    role: string | null;
-    title: string | null;
-    label: string | null;
-    value: string | null;
-    bounds: Rect;
-  }
-  export interface Props {
-    role: string | null;
-    title: string | null;
-    label: string | null;
-    value: string | null;
-    bounds: Rect;
+    return (await this.findAll(query))[0] ?? null;
   }
 }
 ```
 
-### casper/entities/keyboard.ts
+### Keyboard, Mouse, Screen, Clipboard
 
 ```typescript
-import { sym } from "../ffi/symbols.ts";
-import { encodeStr, assertOk } from "../ffi/helpers.ts";
-
-/** Global keyboard — no handle, stateless. */
+// casper/entities/keyboard.ts
 export const Keyboard = {
   async type(text: string, delayMs = 50): Promise<void> {
     const [buf, len] = encodeStr(text);
-    assertOk(
-      sym.casper_keyboard_type(buf, len, BigInt(delayMs)),
-      "Keyboard.type",
-    );
+    assertOk(sym.casper_keyboard_type(buf, len, BigInt(delayMs)), "Keyboard.type");
   },
-
   async hotkey(keys: string, holdMs = 0): Promise<void> {
     const [buf, len] = encodeStr(keys);
-    assertOk(
-      sym.casper_keyboard_hotkey(buf, len, BigInt(holdMs)),
-      "Keyboard.hotkey",
-    );
+    assertOk(sym.casper_keyboard_hotkey(buf, len, BigInt(holdMs)), "Keyboard.hotkey");
   },
-
-  async press(key: string): Promise<void> {
-    await this.hotkey(key);
-  },
+  async press(key: string): Promise<void> { await this.hotkey(key); },
 };
-```
 
-### casper/entities/mouse.ts
-
-```typescript
-import { sym } from "../ffi/symbols.ts";
-import { assertOk } from "../ffi/helpers.ts";
-import type { Point } from "../types.ts";
-
-/** Global mouse — no handle, stateless. */
+// casper/entities/mouse.ts
 export const Mouse = {
   async click(point: Point, button: "left" | "right" = "left", count = 1): Promise<void> {
-    const btn = button === "right" ? 1 : 0;
-    assertOk(sym.casper_mouse_click(point.x, point.y, btn, count), "Mouse.click");
+    assertOk(sym.casper_mouse_click(point.x, point.y, button === "right" ? 1 : 0, count), "Mouse.click");
   },
-
-  async doubleClick(point: Point): Promise<void> {
-    await this.click(point, "left", 2);
-  },
-
-  async rightClick(point: Point): Promise<void> {
-    await this.click(point, "right");
-  },
-
-  async move(point: Point): Promise<void> {
-    assertOk(sym.casper_mouse_move(point.x, point.y), "Mouse.move");
-  },
-
+  async move(point: Point): Promise<void> { assertOk(sym.casper_mouse_move(point.x, point.y), "Mouse.move"); },
   async drag(from: Point, to: Point, steps = 20, stepDelayMs = 10): Promise<void> {
-    assertOk(
-      sym.casper_mouse_drag(from.x, from.y, to.x, to.y, steps, BigInt(stepDelayMs)),
-      "Mouse.drag",
-    );
+    assertOk(sym.casper_mouse_drag(from.x, from.y, to.x, to.y, steps, BigInt(stepDelayMs)), "Mouse.drag");
   },
-
   async scroll(direction: "up" | "down" | "left" | "right", amount = 3): Promise<void> {
-    const [dx, dy] = {
-      up: [0, amount],
-      down: [0, -amount],
-      left: [amount, 0],
-      right: [-amount, 0],
-    }[direction];
+    const [dx, dy] = { up: [0, amount], down: [0, -amount], left: [amount, 0], right: [-amount, 0] }[direction];
     assertOk(sym.casper_mouse_scroll(dx, dy), "Mouse.scroll");
   },
 };
-```
 
-### casper/entities/screen.ts
-
-```typescript
-import { sym } from "../ffi/symbols.ts";
-import { callBytes } from "../ffi/helpers.ts";
-
+// casper/entities/screen.ts
 export const Screen = {
   async capture(displayId = 0): Promise<Uint8Array> {
     const data = callBytes((out) => sym.casper_screen_capture(displayId, out));
@@ -1352,37 +721,25 @@ export const Screen = {
     return data;
   },
 };
-```
 
-### casper/entities/clipboard.ts
-
-```typescript
-import { sym } from "../ffi/symbols.ts";
-import { callBytes, encodeStr, assertOk } from "../ffi/helpers.ts";
-
+// casper/entities/clipboard.ts
 export const Clipboard = {
   read(): string | null {
     const data = callBytes((out) => sym.casper_clipboard_read(out));
-    if (!data) return null;
-    return new TextDecoder().decode(data);
+    return data ? new TextDecoder().decode(data) : null;
   },
-
   write(text: string): void {
     const [buf, len] = encodeStr(text);
     assertOk(sym.casper_clipboard_write(buf, len), "Clipboard.write");
   },
-
-  clear(): void {
-    this.write("");
-  },
+  clear(): void { this.write(""); },
 };
 ```
 
-### casper/mod.ts — Public API
+### Public API
 
 ```typescript
-// Casper — entity-based Mac automation for Deno
-
+// casper/mod.ts
 export { App } from "./entities/app.ts";
 export { Window } from "./entities/window.ts";
 export { Element, type ElementQuery } from "./entities/element.ts";
@@ -1393,1349 +750,22 @@ export { Clipboard } from "./entities/clipboard.ts";
 export type { Point, Rect, Size } from "./types.ts";
 
 import lib from "./ffi/symbols.ts";
-
-/** Shut down Casper. Releases all handles and closes the dylib. */
-export function shutdown(): void {
-  lib.symbols.casper_release_all();
-  lib.close();
-}
-```
-
-### casper/types.ts
-
-```typescript
-export interface Point { x: number; y: number }
-export interface Size { width: number; height: number }
-export interface Rect { x: number; y: number; width: number; height: number }
+export function shutdown(): void { lib.symbols.casper_release_all(); lib.close(); }
 ```
 
 ---
 
-## Usage: Agent Loop
-
-```typescript
-// agent.ts
-import { App, Window, Screen, Keyboard, Mouse, Clipboard, shutdown } from "./casper/mod.ts";
-
-// Check what's running
-const apps = await App.all();
-console.log(`${apps.length} apps running`);
-
-// Find Safari, or launch it
-let safari: App;
-try {
-  safari = await App.find("Safari");
-} catch {
-  safari = await App.launch("com.apple.Safari");
-}
-await safari.activate();
-
-// Get the main window
-const win = await safari.focusedWindow();
-console.log(`Window: "${win.title}"`);
-
-// Screenshot the window
-const png = await win.capture();
-await Deno.writeFile("/tmp/safari.png", png);
-
-// Find the URL bar and type into it
-const urlBar = await win.find({ role: "AXTextField", identifier: "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD" });
-if (urlBar) {
-  await urlBar.click();
-  await Keyboard.hotkey("cmd+a");
-  await Keyboard.type("https://example.com");
-  await Keyboard.press("return");
-}
-
-// Wait for page to load, then find links
-await new Promise(r => setTimeout(r, 2000));
-const links = await win.findAll({ role: "AXLink" });
-console.log(`Found ${links.length} links`);
-
-for (const link of links.slice(0, 3)) {
-  console.log(`  ${link.title} → (${link.bounds.x}, ${link.bounds.y})`);
-}
-
-// Click the first link
-if (links[0]) {
-  await links[0].click();
-}
-
-// Cleanup: release all AX handles
-apps.forEach(a => a.dispose());
-shutdown();
-```
-
----
-
-## Usage: File Operations via Finder
-
-```typescript
-import { App, Keyboard } from "./casper/mod.ts";
-
-const finder = await App.find("Finder");
-await finder.activate();
-
-const win = await finder.focusedWindow();
-
-// Navigate using Go → Go to Folder
-await Keyboard.hotkey("cmd+shift+g");
-const dialog = await win.waitFor({ role: "AXSheet" }, 3000);
-const pathField = await dialog.find({ role: "AXTextField" });
-await pathField!.type("/Users/me/Documents");
-await Keyboard.press("return");
-
-// Select a file
-const files = await win.findAll({ role: "AXRow" });
-if (files[0]) {
-  await files[0].click();
-  // Open it
-  await Keyboard.hotkey("cmd+o");
-}
-```
-
----
-
-## File Layout
-
-```
-casper/
-├── deno.json
-├── Cargo.toml
-├── build.rs
-├── src/                          # Rust
-│   ├── lib.rs
-│   ├── ffi.rs                    # extern "C" — casper_* functions
-│   ├── handles.rs                # handle table
-│   ├── input.rs                  # CGEvent
-│   ├── ax.rs                     # AXUIElement
-│   ├── capture.rs                # screen/window capture
-│   ├── apps.rs                   # NSWorkspace
-│   ├── clipboard.rs              # NSPasteboard
-│   └── permissions.rs            # TCC checks
-└── deno/                         # TypeScript
-    ├── mod.ts                    # public API re-exports
-    ├── types.ts                  # Point, Rect, Size
-    ├── ffi/
-    │   ├── symbols.ts            # Deno.dlopen + symbol defs
-    │   ├── handles.ts            # Handle base class
-    │   └── helpers.ts            # pointer/buffer utils
-    └── entities/
-        ├── app.ts                # App entity
-        ├── window.ts             # Window entity
-        ├── element.ts            # Element entity (AX)
-        ├── keyboard.ts           # Keyboard singleton
-        ├── mouse.ts              # Mouse singleton
-        ├── screen.ts             # Screen singleton
-        ├── clipboard.ts          # Clipboard singleton
-        ├── browser.ts            # Browser extends App
-        ├── tab.ts                # Tab entity
-        ├── finder.ts             # Finder extends App
-        ├── file.ts               # File entity
-        └── dialog.ts             # Dialog entity
-```
-
----
-
-## Entity Classification
-
-| Entity | Handle type | Rust state | Stateless? |
-|---|---|---|---|
-| **App** | PID + AXUIElement | `HandleEntry::App` | No |
-| **Window** | CGWindowID + AXUIElement | `HandleEntry::Window` | No |
-| **Element** | AXUIElement | `HandleEntry::AXElement` | No |
-| **Tab** | AXUIElement (tab element) | `HandleEntry::AXElement` | No |
-| **Dialog** | AXUIElement (sheet/dialog) | `HandleEntry::AXElement` | No |
-| **Keyboard** | — | — | Yes |
-| **Mouse** | — | — | Yes |
-| **Screen** | — | — | Yes |
-| **Clipboard** | — | — | Yes |
-| **File** | path string | (no Rust state) | TS-only |
-| **Finder** | Inherits from App | `HandleEntry::App` | No |
-| **Browser** | Inherits from App | `HandleEntry::App` | No |
-| **Script** | — | — | Yes |
-| **Snapshot** | ref→handle map | (TS-only, holds Element refs) | No |
-
----
-
-## How Handles Flow
-
-```
-1. App.find("Safari")
-   → casper_app_find("Safari")
-   → Rust: finds NSRunningApplication, creates AXUIElement
-   → Rust: inserts HandleEntry::App { pid, ax, ... } → handle=1
-   → Returns JSON: { "handle": 1, "pid": 12345, "name": "Safari" }
-   → TS: new App({ handle: 1, pid: 12345, name: "Safari" })
-
-2. app.windows()
-   → casper_app_windows(handle=1)
-   → Rust: reads handle 1 → app.ax.windows()
-   → Rust: inserts HandleEntry::Window for each → handles 2, 3
-   → Returns JSON: [{ "handle": 2, "title": "Google" }, ...]
-   → TS: [new Window({ handle: 2, title: "Google" }, app)]
-
-3. window.find({ role: "AXButton", title: "Submit" })
-   → casper_window_find_all(handle=2, '{"role":"AXButton","title":"Submit"}')
-   → Rust: reads handle 2 → window.ax.find_all(query)
-   → Rust: inserts HandleEntry::AXElement for match → handle 4
-   → Returns JSON: [{ "handle": 4, "role": "AXButton", "title": "Submit", ... }]
-   → TS: new Element({ handle: 4, ... })
-
-4. element.click()
-   → casper_element_click(handle=4)
-   → Rust: reads handle 4 → element.frame() → gets CURRENT position
-   → Rust: CGEventPost(click at center of element)
-   → Returns 0
-
-5. element.dispose()
-   → casper_release(handle=4)
-   → Rust: removes handle 4, drops AXUIElement
-```
-
----
-
-## AppleScript as a Complementary Control Plane
-
-> Inspired by [spotify-cli-mac](https://github.com/ersel/spotify-cli-mac), which
-> uses AppleScript for all local playback control and the Spotify Web API for
-> search/discovery — choosing the fastest, most reliable mechanism per operation.
-
-### Why both AX and AppleScript?
-
-Accessibility APIs and AppleScript scripting dictionaries are **complementary,
-not competing**:
-
-| | Accessibility (AX) | AppleScript |
-|---|---|---|
-| **What it gives you** | UI structure — buttons, text fields, their positions | Semantic verbs — `play track`, `set volume`, `make new document` |
-| **Works on** | Every app with a GUI (even unsigned) | Only apps that ship a `.sdef` scripting dictionary |
-| **Reliability** | Depends on AX tree quality (Electron can be messy) | Very stable for apps that support it |
-| **Speed** | Must walk the element tree | Direct command dispatch, no tree walking |
-| **Best for** | UI discovery, clicking arbitrary elements, reading layout | App-specific actions, state queries, batch operations |
-
-Many macOS apps expose rich scripting dictionaries: Spotify, Music, Safari,
-Finder, Mail, Messages, Calendar, Reminders, Terminal, Keynote, Pages, Numbers,
-etc. For these apps, AppleScript gives **semantic actions** that are 10x more
-reliable than groping through AX elements.
-
-### The Script entity
-
-`Script` is a stateless entity (no handles) that executes AppleScript via the
-Rust layer, which calls `NSAppleScript` or `OSAScript`:
-
-```typescript
-export const Script = {
-  /**
-   * Execute a command inside `tell application "appName"`.
-   *
-   * @param appName - Application name (e.g. "Spotify", "Safari")
-   * @param command - AppleScript command(s) to run inside the tell block
-   * @param opts.launchIfNeeded - Launch the app first if not running (default: false)
-   * @returns The string result from AppleScript, or null if no return value
-   */
-  async tell(appName: string, command: string, opts?: { launchIfNeeded?: boolean }): Promise<string | null> {
-    // → casper_script_tell("Spotify", "play track \"spotify:track:xxx\"", launch)
-    // Rust: wraps in `tell application "Spotify" to <command>`, executes via NSAppleScript
-  },
-
-  /**
-   * Execute a full AppleScript source string. Returns the result parsed as
-   * a JSON-compatible record when possible.
-   */
-  async eval(source: string): Promise<Record<string, unknown> | string | null> {
-    // → casper_script_eval(source)
-    // Rust: NSAppleScript executeAndReturnError
-  },
-
-  /**
-   * Check whether an application has a scripting dictionary (.sdef).
-   */
-  async canScript(appName: string): Promise<boolean> {
-    // → casper_script_can_script("Spotify")
-    // Rust: check for .sdef in app bundle
-  },
-};
-```
-
-### Rust FFI surface
-
-```rust
-/// Execute `tell application "<app>" to <command>`.
-/// Returns the AppleScript result string (or null pointer on failure).
-#[unsafe(no_mangle)]
-pub extern "C" fn casper_script_tell(
-    app: *const u8, app_len: u32,
-    command: *const u8, command_len: u32,
-    launch_if_needed: u8,
-    out_len: *mut u64,
-) -> *mut u8 {
-    let app_name = unsafe { str_from_buf(app, app_len) };
-    let cmd = unsafe { str_from_buf(command, command_len) };
-
-    if launch_if_needed != 0 {
-        // Check NSWorkspace for running app, launch if absent
-        let _ = crate::apps::launch_app_by_name(app_name);
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
-
-    let script = format!("tell application \"{}\" to {}", app_name, cmd);
-    match crate::scripting::execute(&script) {
-        Ok(result) => match result {
-            Some(s) => vec_to_ffi(s.into_bytes(), out_len),
-            None => { unsafe { *out_len = 0; } ptr::null_mut() }
-        },
-        Err(_) => { unsafe { *out_len = 0; } ptr::null_mut() }
-    }
-}
-
-/// Execute a full AppleScript source. Returns JSON-encoded result.
-#[unsafe(no_mangle)]
-pub extern "C" fn casper_script_eval(
-    source: *const u8, source_len: u32,
-    out_len: *mut u64,
-) -> *mut u8 { /* ... */ }
-
-/// Check if an app has a scripting dictionary.
-#[unsafe(no_mangle)]
-pub extern "C" fn casper_script_can_script(
-    app: *const u8, app_len: u32,
-) -> u8 { /* 1 = yes, 0 = no */ }
-```
-
-### When to use Script vs AX
-
-```
-Agent decides to control Spotify:
-
-  1. Is Spotify scriptable?
-     → Script.canScript("Spotify") → true
-
-  2. Use Script for semantic actions:
-     → Script.tell("Spotify", "play track \"spotify:track:xxx\"")
-     → Script.tell("Spotify", "set sound volume to 75")
-     → Script.tell("Spotify", "next track")
-
-  3. Use AX only when you need UI structure:
-     → e.g., reading the layout of the "Now Playing" view for a screenshot
-     → or clicking a custom UI element that has no scripting verb
-
-Agent decides to control a random Electron app:
-
-  1. Is it scriptable?
-     → Script.canScript("SomeElectronApp") → false
-
-  2. Fall back to AX entirely:
-     → App.find("SomeElectronApp") → windows → findAll → click
-```
-
----
-
-## App Profiles
-
-App profiles are bundled metadata about well-known applications — their
-scripting verbs, AX landmarks, and keyboard shortcuts. They let agents skip
-exploratory AX tree walking for common operations.
-
-```typescript
-// casper/profiles/types.ts
-export interface AppProfile {
-  bundleId: string;
-  name: string;
-  scriptable: boolean;
-
-  /** AppleScript verb templates. Keyed by action name. */
-  verbs?: Record<string, string | ((...args: unknown[]) => string)>;
-
-  /** Well-known keyboard shortcuts. */
-  shortcuts?: Record<string, string>;
-
-  /** AppleScript expressions that return state. */
-  queries?: Record<string, string>;
-
-  /** AX element landmarks — known identifiers/roles for key UI elements. */
-  landmarks?: Record<string, ElementQuery>;
-}
-```
-
-### Example: Spotify
-
-```typescript
-// casper/profiles/spotify.ts
-import type { AppProfile } from "./types.ts";
-
-export const spotify: AppProfile = {
-  bundleId: "com.spotify.client",
-  name: "Spotify",
-  scriptable: true,
-
-  verbs: {
-    play: (uri?: string) => uri ? `play track "${uri}"` : "play",
-    pause: "pause",
-    toggle: "playpause",
-    next: "next track",
-    previous: "previous track",
-    volume: (n: number) => `set sound volume to ${n}`,
-    seek: (seconds: number) => `set player position to ${seconds}`,
-    shuffle: "set shuffling to not shuffling",
-    repeat: "set repeating to not repeating",
-  },
-
-  shortcuts: {
-    search: "cmd+k",
-    preferences: "cmd+,",
-    newPlaylist: "cmd+n",
-  },
-
-  queries: {
-    nowPlaying: `
-      set a to artist of current track
-      set t to name of current track
-      set al to album of current track
-      set d to duration of current track
-      set p to player position
-      set s to player state as string
-      set u to spotify url of current track
-      set art to artwork url of current track
-      return {artist:a, track:t, album:al, duration:d, position:p, state:s, url:u, artwork:art}
-    `,
-    isPlaying: "return player state is playing",
-    currentVolume: "return sound volume",
-    isShuffling: "return shuffling",
-    isRepeating: "return repeating",
-  },
-
-  landmarks: {
-    searchField: { role: "AXTextField", identifier: "search-input" },
-    playButton: { role: "AXButton", label: "Play" },
-    nowPlayingBar: { role: "AXGroup", identifier: "now-playing-bar" },
-  },
-};
-```
-
-### Example: Safari
-
-```typescript
-// casper/profiles/safari.ts
-import type { AppProfile } from "./types.ts";
-
-export const safari: AppProfile = {
-  bundleId: "com.apple.Safari",
-  name: "Safari",
-  scriptable: true,
-
-  verbs: {
-    openUrl: (url: string) => `open location "${url}"`,
-    currentUrl: "return URL of current tab of front window",
-    currentTitle: "return name of current tab of front window",
-    newTab: (url?: string) => url
-      ? `tell front window to set current tab to (make new tab with properties {URL:"${url}"})`
-      : "tell front window to make new tab",
-    closeTab: "close current tab of front window",
-    listTabs: `
-      set tabList to {}
-      tell front window
-        repeat with t in tabs
-          set end of tabList to {name of t, URL of t}
-        end repeat
-      end tell
-      return tabList
-    `,
-  },
-
-  shortcuts: {
-    addressBar: "cmd+l",
-    newTab: "cmd+t",
-    closeTab: "cmd+w",
-    reload: "cmd+r",
-    back: "cmd+[",
-    forward: "cmd+]",
-  },
-
-  landmarks: {
-    addressBar: { role: "AXTextField", identifier: "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD" },
-    webContent: { role: "AXWebArea" },
-  },
-};
-```
-
-### Example: Music
-
-```typescript
-// casper/profiles/music.ts
-import type { AppProfile } from "./types.ts";
-
-export const music: AppProfile = {
-  bundleId: "com.apple.Music",
-  name: "Music",
-  scriptable: true,
-
-  verbs: {
-    play: "play",
-    pause: "pause",
-    toggle: "playpause",
-    next: "next track",
-    previous: "back track",
-    volume: (n: number) => `set sound volume to ${n}`,
-    search: (query: string) => `search playlist "Library" for "${query}"`,
-  },
-
-  queries: {
-    nowPlaying: `
-      set a to artist of current track
-      set t to name of current track
-      set al to album of current track
-      set d to duration of current track
-      set p to player position
-      return {artist:a, track:t, album:al, duration:d, position:p}
-    `,
-  },
-};
-```
-
-### Profile registry
-
-```typescript
-// casper/profiles/mod.ts
-import { spotify } from "./spotify.ts";
-import { safari } from "./safari.ts";
-import { music } from "./music.ts";
-import type { AppProfile } from "./types.ts";
-
-const profiles = new Map<string, AppProfile>();
-
-function register(profile: AppProfile): void {
-  profiles.set(profile.bundleId, profile);
-  profiles.set(profile.name.toLowerCase(), profile);
-}
-
-register(spotify);
-register(safari);
-register(music);
-
-/** Look up a profile by bundle ID or app name. */
-export function getProfile(appOrBundleId: string): AppProfile | undefined {
-  return profiles.get(appOrBundleId) ?? profiles.get(appOrBundleId.toLowerCase());
-}
-```
-
-Profiles are **optional hints**, not requirements. If an agent has a profile,
-it can take the fast path. Without one, it falls back to AX exploration.
-
----
-
-## Hybrid Control: Script + Web API + AX
-
-Real-world automation often combines multiple control planes. Casper provides
-the local planes (AX and Script); external API calls come from outside (e.g.,
-Tachikoma providers or direct `fetch` calls in agent code).
-
-### Pattern: search remotely, play locally
-
-```typescript
-// Agent-level code: Tachikoma handles the Spotify Web API
-const results = await tachikoma.call("spotify-search", { query: "Bohemian Rhapsody" });
-const track = results[0]; // { uri: "spotify:track:4uLU6hMCjMI75M1A2tKUQC", name: "..." }
-
-// Casper handles local playback — no UI fumbling needed
-await Script.tell("Spotify", `play track "${track.uri}"`, { launchIfNeeded: true });
-```
-
-This is **dramatically more reliable** than automating the Spotify search UI:
-
-| Approach | Steps | Failure modes |
-|---|---|---|
-| AX-only | Launch → find search field → type → wait → find result row → click | AX tree mismatch, wrong result clicked, timing issues |
-| Script-only | `tell Spotify to play track "uri"` | Need to know the URI already |
-| Hybrid (Web API + Script) | API search → `tell Spotify to play track "uri"` | Network for search, but local play is rock-solid |
-
-### Pattern: read state via Script, act via AX
-
-```typescript
-// Fast state read via AppleScript
-const state = await Script.eval(`
-  tell application "Spotify"
-    return {playerState:player state as string, track:name of current track}
-  end tell
-`);
-
-if (state.playerState === "paused") {
-  // Need to click a specific UI element? Use AX.
-  const spotify = await App.find("Spotify");
-  const win = await spotify.focusedWindow();
-  const customBtn = await win.find({ role: "AXButton", identifier: "some-custom-ui" });
-  await customBtn?.click();
-}
-```
-
-### Pattern: script with fallback to AX
-
-```typescript
-async function playTrack(uri: string): Promise<void> {
-  if (await Script.canScript("Spotify")) {
-    // Fast path: AppleScript
-    await Script.tell("Spotify", `play track "${uri}"`, { launchIfNeeded: true });
-  } else {
-    // Fallback: UI automation
-    const spotify = await App.launch("com.spotify.client");
-    await spotify.activate();
-    const win = await spotify.focusedWindow();
-    await Keyboard.hotkey("cmd+k");
-    const search = await win.waitFor({ role: "AXTextField" }, 3000);
-    await search.type(uri);
-    await Keyboard.press("return");
-  }
-}
-```
-
----
-
-## Deno Modules: The Third Control Plane
-
-The Hybrid Control section above shows that real automation mixes AX, Script,
-and external API calls. But those API calls were left vague — "Tachikoma
-providers or direct `fetch` calls in agent code." Deno modules formalize this
-as a first-class control plane alongside Native and Script.
-
-### Why three planes?
-
-Each plane reaches apps through a different mechanism, and each has a domain
-where it's the only reliable option:
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        Casper Control Planes                           │
-│                                                                        │
-│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────────┐ │
-│  │  Native (Rust)   │  │  Script          │  │  Module (Deno)       │ │
-│  │                  │  │  (AppleScript)   │  │                      │ │
-│  │  AX handles      │  │  .sdef verbs     │  │  HTTP/WS APIs        │ │
-│  │  CGEvent input   │  │  System Events   │  │  CDP protocol        │ │
-│  │  Screen capture  │  │  Finder ops      │  │  File watchers       │ │
-│  │  Window geometry │  │  `open` URLs     │  │  IPC sockets         │ │
-│  │  Process info    │  │  Batch scripting  │  │  Cross-app glue      │ │
-│  │                  │  │                  │  │  Plugin hosting       │ │
-│  └────────┬─────────┘  └────────┬─────────┘  └──────────┬───────────┘ │
-│           │                     │                        │             │
-│           │     Rust FFI        │    NSAppleScript FFI   │   Native    │
-│           │    Deno.dlopen()    │   casper_script_tell() │  Deno APIs  │
-│           │                     │                        │   (fetch,   │
-│           │                     │                        │  WebSocket, │
-│           │                     │                        │  Deno.open) │
-│           └─────────────────────┴────────────────────────┘             │
-│                                 │                                      │
-│                          Entity Layer                                  │
-│              App  Window  Element  Script  Keyboard  ...               │
-│                                                                        │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-| | **Native** | **Script** | **Module** |
-|---|---|---|---|
-| **Mechanism** | AX API, CGEvent, NSWorkspace | AppleScript/JXA via NSAppleScript | HTTP, WebSocket, CDP, files, IPC |
-| **What it reaches** | Every GUI app (even unsigned) | Apps with `.sdef` scripting dictionaries | Apps with local servers, APIs, or config files |
-| **Best for** | UI discovery, clicking, typing, reading layout | Semantic verbs, batch operations, state queries | API-driven actions, browser devtools, file/config ops |
-| **Speed** | Fast (in-process FFI) | Fast (in-process FFI) | Varies (local HTTP is fast, network APIs add latency) |
-| **Reliability** | Depends on AX tree quality | Very stable for scriptable apps | Very stable (structured protocols) |
-| **Requires** | Accessibility TCC grant | Accessibility or Automation TCC | Usually nothing (local HTTP is sandboxed) |
-
-### What Deno modules unlock
-
-**1. Local HTTP APIs** — Many modern Mac apps expose local REST or WebSocket
-servers for automation:
-
-```typescript
-// casper/modules/raycast.ts — Raycast deeplinks via HTTP
-export async function runCommand(extensionName: string, command: string): Promise<void> {
-  // Raycast exposes a deeplink protocol
-  await Script.eval(`open location "raycast://extensions/${extensionName}/${command}"`);
-}
-
-// casper/modules/obsidian.ts — Obsidian Local REST API plugin
-export async function createNote(vault: string, path: string, content: string): Promise<void> {
-  const port = await readObsidianPort(vault); // reads from plugin config
-  await fetch(`http://127.0.0.1:${port}/vault/${encodeURIComponent(path)}`, {
-    method: "PUT",
-    headers: { "Content-Type": "text/markdown", Authorization: `Bearer ${await readApiKey(vault)}` },
-    body: content,
-  });
-}
-
-// casper/modules/homeassistant.ts — Home Assistant local API
-export async function turnOn(entityId: string): Promise<void> {
-  await fetch("http://homeassistant.local:8123/api/services/homeassistant/turn_on", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${await readHAToken()}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ entity_id: entityId }),
-  });
-}
-```
-
-**2. Chrome DevTools Protocol (CDP)** — Deep browser automation beyond what
-AX provides. Arc, Chrome, Edge, and Brave all expose CDP over a WebSocket
-when launched with `--remote-debugging-port`:
-
-```typescript
-// casper/modules/cdp.ts
-export class CDPSession {
-  private ws: WebSocket;
-  private nextId = 1;
-  private pending = new Map<number, { resolve: Function; reject: Function }>();
-
-  static async connect(port = 9222): Promise<CDPSession> {
-    // Discover the WebSocket URL from the JSON endpoint
-    const res = await fetch(`http://127.0.0.1:${port}/json/version`);
-    const { webSocketDebuggerUrl } = await res.json();
-    const ws = new WebSocket(webSocketDebuggerUrl);
-    await new Promise((resolve, reject) => {
-      ws.onopen = resolve;
-      ws.onerror = reject;
-    });
-    return new CDPSession(ws);
-  }
-
-  private constructor(ws: WebSocket) {
-    this.ws = ws;
-    this.ws.onmessage = (event) => {
-      const msg = JSON.parse(event.data as string);
-      if (msg.id && this.pending.has(msg.id)) {
-        const { resolve, reject } = this.pending.get(msg.id)!;
-        this.pending.delete(msg.id);
-        if (msg.error) reject(new Error(msg.error.message));
-        else resolve(msg.result);
-      }
-    };
-  }
-
-  async send(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
-    const id = this.nextId++;
-    return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.ws.send(JSON.stringify({ id, method, params }));
-    });
-  }
-
-  /** Navigate to a URL and wait for load. */
-  async navigate(url: string): Promise<void> {
-    await this.send("Page.navigate", { url });
-    await this.send("Page.enable");
-    // Could wait for Page.loadEventFired here
-  }
-
-  /** Execute JavaScript in the page context. */
-  async evaluate(expression: string): Promise<unknown> {
-    const result = await this.send("Runtime.evaluate", {
-      expression,
-      returnByValue: true,
-    }) as { result: { value: unknown } };
-    return result.result.value;
-  }
-
-  /** Get the DOM as accessible text (like Semantic Snapshots but from CDP). */
-  async getAccessibilityTree(): Promise<unknown> {
-    return await this.send("Accessibility.getFullAXTree");
-  }
-
-  /** Click an element by CSS selector. */
-  async click(selector: string): Promise<void> {
-    await this.evaluate(`document.querySelector(${JSON.stringify(selector)}).click()`);
-  }
-
-  /** Type into the focused element. */
-  async type(text: string): Promise<void> {
-    for (const char of text) {
-      await this.send("Input.dispatchKeyEvent", {
-        type: "keyDown", text: char, key: char,
-      });
-      await this.send("Input.dispatchKeyEvent", {
-        type: "keyUp", text: char, key: char,
-      });
-    }
-  }
-
-  close(): void {
-    this.ws.close();
-  }
-}
-```
-
-This complements AX-based browser automation — CDP gives you DOM-level
-precision (CSS selectors, JS evaluation, network interception), while AX
-gives you the native chrome (address bar, tab strip, browser menus):
-
-```typescript
-// Use AX for the browser shell
-const safari = await Browser.findOrLaunch("com.google.Chrome");
-const win = await safari.focusedWindow();
-const addressBar = await win.find({ role: "AXTextField", identifier: "address" });
-
-// Use CDP for page content
-const cdp = await CDPSession.connect(9222);
-await cdp.navigate("https://example.com");
-const title = await cdp.evaluate("document.title");
-await cdp.click("#login-button");
-await cdp.type("my-username");
-```
-
-**3. Unix domain sockets / IPC** — Some apps expose automation via Unix
-sockets (Docker, VS Code extension host, various daemons):
-
-```typescript
-// casper/modules/docker.ts — Docker API via Unix socket
-export async function listContainers(): Promise<unknown[]> {
-  // Deno supports Unix domain sockets via Deno.connect
-  const conn = await Deno.connect({ path: "/var/run/docker.sock", transport: "unix" });
-
-  const request = new TextEncoder().encode(
-    "GET /v1.44/containers/json HTTP/1.1\r\nHost: localhost\r\n\r\n"
-  );
-  await conn.write(request);
-
-  const buf = new Uint8Array(65536);
-  const n = await conn.read(buf);
-  conn.close();
-
-  const response = new TextDecoder().decode(buf.subarray(0, n!));
-  const body = response.split("\r\n\r\n")[1];
-  return JSON.parse(body);
-}
-```
-
-**4. File system as an API** — Many apps store state in known locations.
-Reading/writing these files is automation too:
-
-```typescript
-// casper/modules/vscode.ts — Read VS Code settings
-export async function getSettings(): Promise<Record<string, unknown>> {
-  const home = Deno.env.get("HOME")!;
-  const settingsPath = `${home}/Library/Application Support/Code/User/settings.json`;
-  const text = await Deno.readTextFile(settingsPath);
-  return JSON.parse(text);
-}
-
-export async function updateSetting(key: string, value: unknown): Promise<void> {
-  const settings = await getSettings();
-  settings[key] = value;
-  const home = Deno.env.get("HOME")!;
-  const settingsPath = `${home}/Library/Application Support/Code/User/settings.json`;
-  await Deno.writeTextFile(settingsPath, JSON.stringify(settings, null, 2));
-}
-
-// casper/modules/defaults.ts — macOS defaults (plist) wrappers
-export async function read(domain: string, key: string): Promise<string> {
-  const cmd = new Deno.Command("defaults", { args: ["read", domain, key] });
-  const { stdout } = await cmd.output();
-  return new TextDecoder().decode(stdout).trim();
-}
-
-export async function write(domain: string, key: string, type: string, value: string): Promise<void> {
-  const cmd = new Deno.Command("defaults", { args: ["write", domain, key, `-${type}`, value] });
-  await cmd.output();
-}
-```
-
-### How Module fits the entity model
-
-Modules don't replace entities — they **extend** specific entities with
-richer capabilities when a protocol-based channel is available. The pattern:
-
-```typescript
-// casper/entities/browser.ts — Browser entity gains a CDP accessor
-export class Browser extends App {
-  private _cdp?: CDPSession;
-
-  /** Get a CDP session for deep page automation. Requires --remote-debugging-port. */
-  async cdp(port = 9222): Promise<CDPSession> {
-    if (!this._cdp) {
-      this._cdp = await CDPSession.connect(port);
-    }
-    return this._cdp;
-  }
-
-  // Existing methods still work:
-  // focusedWindow(), find(), activate(), etc.
-}
-
-// Usage — mix freely:
-const chrome = await Browser.findOrLaunch("com.google.Chrome");
-const win = await chrome.focusedWindow();             // Native plane
-const addressUrl = await win.find({ role: "AXTextField" }); // Native plane
-
-const cdp = await chrome.cdp();                        // Module plane
-await cdp.navigate("https://example.com");             // Module plane
-const pageTitle = await cdp.evaluate("document.title");// Module plane
-
-await Keyboard.hotkey("cmd+l");                        // Native plane (input)
-```
-
-### How Module fits the profile model
-
-App profiles gain a `modules` section declaring what protocol-based channels
-are available:
-
-```typescript
-export interface AppProfile {
-  bundleId: string;
-  name: string;
-  scriptable: boolean;
-
-  verbs?: Record<string, string | ((...args: unknown[]) => string)>;
-  shortcuts?: Record<string, string>;
-  queries?: Record<string, string>;
-  landmarks?: Record<string, ElementQuery>;
-
-  // New: module capabilities
-  modules?: {
-    /** App exposes CDP when launched with --remote-debugging-port. */
-    cdp?: { defaultPort: number; launchArgs?: string[] };
-    /** App exposes a local HTTP API. */
-    http?: { port: number | (() => Promise<number>); basePath?: string };
-    /** App exposes a Unix domain socket. */
-    socket?: { path: string };
-    /** App stores config/state in known file locations. */
-    files?: Record<string, string>;  // logical name → path template
-  };
-}
-```
-
-Example — Chrome profile with CDP:
-
-```typescript
-export const chrome: AppProfile = {
-  bundleId: "com.google.Chrome",
-  name: "Chrome",
-  scriptable: true,
-
-  verbs: {
-    openUrl: (url: string) => `open location "${url}"`,
-    currentUrl: "return URL of active tab of front window",
-  },
-
-  shortcuts: {
-    addressBar: "cmd+l",
-    newTab: "cmd+t",
-    devTools: "cmd+opt+i",
-  },
-
-  landmarks: {
-    addressBar: { role: "AXTextField", identifier: "address" },
-    webContent: { role: "AXWebArea" },
-  },
-
-  modules: {
-    cdp: {
-      defaultPort: 9222,
-      launchArgs: ["--remote-debugging-port=9222"],
-    },
-    files: {
-      settings: "${HOME}/Library/Application Support/Google/Chrome/Default/Preferences",
-      bookmarks: "${HOME}/Library/Application Support/Google/Chrome/Default/Bookmarks",
-    },
-  },
-};
-```
-
-### Plane selection logic
-
-When a recipe needs to perform an action, it selects the best plane:
-
-```typescript
-// casper/recipes/browser.ts — navigate uses the best available plane
-
-export const navigate: Recipe<{ url: string; app?: string }, void> = {
-  meta: {
-    name: "browser.navigate",
-    description: "Navigate the browser to a URL",
-    category: "browser",
-    params: {
-      url: { type: "string", description: "URL to navigate to", required: true },
-      app: { type: "string", description: "Browser app name" },
-    },
-  },
-
-  async execute({ url, app = "Safari" }) {
-    const profile = getProfile(app);
-    const browser = await Browser.findOrLaunch(profile?.bundleId ?? app);
-
-    // Priority 1: CDP if available (most precise for page navigation)
-    if (profile?.modules?.cdp) {
-      try {
-        const cdp = await browser.cdp(profile.modules.cdp.defaultPort);
-        await cdp.navigate(url);
-        return;
-      } catch {
-        // CDP not running — fall through
-      }
-    }
-
-    // Priority 2: AppleScript if scriptable (fast, reliable)
-    if (profile?.scriptable && profile.verbs?.openUrl) {
-      const verb = typeof profile.verbs.openUrl === "function"
-        ? profile.verbs.openUrl(url) : profile.verbs.openUrl;
-      await Script.tell(app, verb);
-      return;
-    }
-
-    // Priority 3: AX automation (always works if we have TCC)
-    await browser.activate();
-    await Keyboard.hotkey(profile?.shortcuts?.addressBar ?? "cmd+l");
-    await Keyboard.hotkey("cmd+a");
-    await Keyboard.type(url);
-    await Keyboard.press("return");
-  },
-};
-```
-
-### What makes Deno particularly good here
-
-**`Deno.dlopen`** — Casper already uses this for Rust FFI. The same mechanism
-lets module authors call other native libraries without Node-API boilerplate:
-
-```typescript
-// Hypothetical: talk to a DAW's C API
-const lib = Deno.dlopen("/Applications/Logic Pro.app/Contents/Frameworks/CoreAudio.framework/CoreAudio", {
-  getTransportState: { parameters: [], result: "i32" },
-});
-```
-
-**Permission model** — Third-party recipes run with Deno's granular permissions.
-A Spotify recipe only needs `--allow-net=127.0.0.1:4370` (Spotify's local
-HTTPS server). A file-reading module needs `--allow-read=/path/to/config`.
-The host can enforce least-privilege:
-
-```typescript
-// casper/runtime/sandbox.ts
-export async function runThirdPartyRecipe(
-  recipePath: string,
-  args: Record<string, unknown>,
-  permissions: Deno.PermissionOptions,
-): Promise<unknown> {
-  // Run in a Deno worker with restricted permissions
-  const worker = new Worker(new URL(recipePath, import.meta.url), {
-    type: "module",
-    deno: {
-      permissions: {
-        net: permissions.net ?? false,   // no network by default
-        read: permissions.read ?? false, // no file reads by default
-        write: false,                    // never write by default
-        run: false,                      // never spawn by default
-        ffi: false,                      // never FFI by default (only core Casper)
-        env: false,                      // no env access by default
-      },
-    },
-  });
-
-  // Message-passing interface to the recipe
-  worker.postMessage({ type: "execute", args });
-  return new Promise((resolve, reject) => {
-    worker.onmessage = (e) => {
-      if (e.data.type === "result") resolve(e.data.value);
-      if (e.data.type === "error") reject(new Error(e.data.message));
-      worker.terminate();
-    };
-  });
-}
-```
-
-**JSR ecosystem** — Module authors publish to JSR (Deno's registry) with full
-TypeScript types. Users install with `deno add`, and the module shows up as
-recipes automatically:
-
-```
-$ deno add jsr:@casper/obsidian
-$ casper obsidian.create-note --vault "My Vault" --path "daily/today.md" --content "# Today"
-```
-
-**`deno compile`** — The entire Casper CLI (entities + recipes + modules)
-compiles to a single binary. No Node.js, no npm, no `node_modules`.
-
-### Comparison: Planes × surfaces
-
-Each plane can be exposed through any surface (CLI, MCP, skill, direct code):
-
-```
-                    ┌─────────┬──────────┬─────────────┬────────────┐
-                    │   CLI   │   MCP    │  Skill Desc │  TS Import │
-┌───────────────────┼─────────┼──────────┼─────────────┼────────────┤
-│ Native (AX/Input) │ casper  │ JSON     │ "click the  │ element    │
-│                   │ click   │ schema   │  Save btn"  │ .click()   │
-│                   │ --query │          │             │            │
-├───────────────────┼─────────┼──────────┼─────────────┼────────────┤
-│ Script            │ casper  │ JSON     │ "tell       │ Script     │
-│ (AppleScript)     │ spotify │ schema   │  Spotify    │ .tell()    │
-│                   │ .play   │          │  to play"   │            │
-├───────────────────┼─────────┼──────────┼─────────────┼────────────┤
-│ Module            │ casper  │ JSON     │ "create     │ obsidian   │
-│ (Deno)            │ obsidian│ schema   │  a note in  │ .create    │
-│                   │ .create │          │  Obsidian"  │ Note()     │
-└───────────────────┴─────────┴──────────┴─────────────┴────────────┘
-```
-
-The recipe layer normalizes all three planes into the same external interface.
-The calling code (CLI, MCP, agent) never needs to know which plane a recipe
-uses internally — it just calls `recipe.execute(args)` and the recipe picks
-the best plane for the job.
-
----
-
-## Web Content Extensions
-
-Browser-hosted apps (Twitter/X, Gmail, Slack web) present challenges that
-native apps don't: deep AX trees, dynamic content, and elements behind an
-`AXWebArea` boundary.
-
-### Window.findInPage() — crossing the AXWebArea boundary
-
-Browser windows have an AX structure like:
-
-```
-AXWindow → AXSplitGroup → AXGroup → AXWebArea → (all page content here)
-```
-
-Standard `findAll()` searches the full subtree, but `findInPage()` makes
-intent explicit and could apply web-specific optimizations:
-
-```typescript
-export class Window extends Handle {
-  /** Find elements within the web content area (crosses AXWebArea boundary). */
-  async findInPage(query: ElementQuery): Promise<Element[]> {
-    const webArea = await this.find({ role: "AXWebArea" });
-    if (!webArea) return [];
-    return webArea.findAll(query);
-  }
-
-  /** Wait for an element within web content to appear. */
-  async waitForInPage(query: ElementQuery, timeoutMs = 10000): Promise<Element> {
-    const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
-      const results = await this.findInPage(query);
-      if (results[0]) return results[0];
-      await new Promise(r => setTimeout(r, 300));
-    }
-    throw new Error(`Timed out waiting for web element: ${JSON.stringify(query)}`);
-  }
-}
-```
-
-### Extended ElementQuery for web content
-
-Web content elements often lack clean titles but have DOM-specific AX
-attributes. The query interface should support these:
-
-```typescript
-export interface ElementQuery {
-  // Existing — works for all AX elements
-  role?: string;
-  title?: string;
-  titleContains?: string;
-  label?: string;
-  value?: string;
-  identifier?: string;
-  enabled?: boolean;
-
-  // New — especially useful for web content and Electron apps
-  description?: string;           // AXDescription (exact)
-  descriptionContains?: string;   // AXDescription (substring)
-  valueContains?: string;         // AXValue (substring)
-  roleDescription?: string;       // e.g. "link", "button", "heading", "article"
-  url?: string;                   // AXLink URL attribute (exact)
-  urlContains?: string;           // AXLink URL attribute (substring)
-  domId?: string;                 // AXDOMIdentifier
-  domClass?: string;              // matches within AXDOMClassList
-}
-```
-
-### Usage: opening a tweet
-
-```typescript
-const safari = await Browser.findOrLaunch("com.apple.Safari");
-
-// Use Script for navigation (faster than AX for scriptable browsers)
-await Script.tell("Safari", 'open location "https://x.com/user/status/123"');
-
-const win = await safari.focusedWindow();
-
-// Wait for the tweet to render in web content
-const tweet = await win.waitForInPage(
-  { role: "AXGroup", roleDescription: "article" },
-  10000,
-);
-
-// Interact with elements inside the tweet
-const likeBtn = await tweet.find({ role: "AXButton", label: "Like" });
-if (likeBtn) await likeBtn.click();
-
-// Or find a specific link within the page
-const link = await win.findInPage({
-  role: "AXLink",
-  urlContains: "/status/123",
-});
-```
-
-### Rust-side ElementQuery additions
-
-```rust
-#[derive(serde::Deserialize)]
-struct ElementQuery {
-    // existing fields...
-    role: Option<String>,
-    title: Option<String>,
-    #[serde(rename = "titleContains")]
-    title_contains: Option<String>,
-    label: Option<String>,
-    value: Option<String>,
-    identifier: Option<String>,
-    enabled: Option<bool>,
-
-    // new fields for web content
-    description: Option<String>,
-    #[serde(rename = "descriptionContains")]
-    description_contains: Option<String>,
-    #[serde(rename = "valueContains")]
-    value_contains: Option<String>,
-    #[serde(rename = "roleDescription")]
-    role_description: Option<String>,
-    url: Option<String>,
-    #[serde(rename = "urlContains")]
-    url_contains: Option<String>,
-    #[serde(rename = "domId")]
-    dom_id: Option<String>,
-    #[serde(rename = "domClass")]
-    dom_class: Option<String>,
-}
-
-impl ElementQuery {
-    fn matches(&self, elem: &crate::ax::AXElement) -> bool {
-        // ... existing checks ...
-
-        if let Some(ref desc) = self.description {
-            if elem.description().as_deref() != Some(desc.as_str()) { return false; }
-        }
-        if let Some(ref contains) = self.description_contains {
-            match elem.description() {
-                Some(d) if d.contains(contains.as_str()) => {}
-                _ => return false,
-            }
-        }
-        if let Some(ref contains) = self.value_contains {
-            match elem.value() {
-                Some(v) if v.contains(contains.as_str()) => {}
-                _ => return false,
-            }
-        }
-        if let Some(ref rd) = self.role_description {
-            if elem.role_description().as_deref() != Some(rd.as_str()) { return false; }
-        }
-        if let Some(ref url) = self.url {
-            if elem.ax_attr_string("AXURL").as_deref() != Some(url.as_str()) { return false; }
-        }
-        if let Some(ref contains) = self.url_contains {
-            match elem.ax_attr_string("AXURL") {
-                Some(u) if u.contains(contains.as_str()) => {}
-                _ => return false,
-            }
-        }
-        if let Some(ref dom_id) = self.dom_id {
-            if elem.ax_attr_string("AXDOMIdentifier").as_deref() != Some(dom_id.as_str()) { return false; }
-        }
-        if let Some(ref dom_class) = self.dom_class {
-            match elem.ax_attr_string("AXDOMClassList") {
-                Some(classes) if classes.contains(dom_class.as_str()) => {}
-                _ => return false,
-            }
-        }
-        true
-    }
-}
-```
-
----
-
-## Semantic Snapshots
-
-> Inspired by [OpenClaw](https://github.com/openclaw/openclaw)'s browser tool,
-> which parses the accessibility tree into structured text with element
-> references instead of sending screenshots to the LLM — ~100x cheaper in
-> tokens and more precise than pixel-coordinate guessing.
-
-### The problem
-
-An agent controlling a GUI needs to **see** what's on screen, then **act** on
-what it sees. There are three approaches:
-
-| Approach | Token cost | Precision | Handles UI changes? |
-|---|---|---|---|
-| **Screenshot** | ~1,500 tokens per image (base64) | Coordinate guessing from pixels | No — stale coordinates |
-| **Full AX dump** | Hundreds of elements, 5k+ tokens | Exact, but overwhelming | No — data snapshot |
-| **Semantic snapshot** | Compact text, ~200-500 tokens | Exact ref→handle mapping | Yes — refs hold live handles |
-
-Semantic snapshots are the sweet spot: compact enough for LLM context, precise
-enough for direct action, and backed by live handles so refs track UI changes.
-
-### The Snapshot entity
-
-`Window.snapshot()` walks the AX tree and produces a `Snapshot` — a text
-representation with numbered refs, plus a map from ref numbers to live
-`Element` handles:
-
-```typescript
-interface SnapshotOpts {
-  /** Maximum tree depth to walk (default: 10) */
-  maxDepth?: number;
-  /** Only snapshot web content (AXWebArea subtree) */
-  webContentOnly?: boolean;
-  /** Include element bounds in output (default: false) */
-  includeBounds?: boolean;
-  /** Roles to skip (e.g. ["AXGroup", "AXGenericElement"] to reduce noise) */
-  skipRoles?: string[];
-}
-
-export class Snapshot implements Disposable {
-  /** Compact text representation of the AX tree. */
-  readonly text: string;
-
-  /** Map from ref number to live Element handle. */
-  readonly refs: Map<number, Element>;
-
-  /** Click an element by its ref number. */
-  async click(ref: number): Promise<void> {
-    const el = this.refs.get(ref);
-    if (!el) throw new Error(`Unknown ref: ${ref}`);
-    await el.click();
-  }
-
-  /** Type text into an element by its ref number. */
-  async type(ref: number, text: string): Promise<void> {
-    const el = this.refs.get(ref);
-    if (!el) throw new Error(`Unknown ref: ${ref}`);
-    await el.type(text);
-  }
-
-  /** Get the Element handle for a ref. */
-  get(ref: number): Element {
-    const el = this.refs.get(ref);
-    if (!el) throw new Error(`Unknown ref: ${ref}`);
-    return el;
-  }
-
-  /** Release all Element handles held by this snapshot. */
-  dispose(): void {
-    for (const el of this.refs.values()) {
-      el.dispose();
-    }
-    this.refs.clear();
-  }
-
-  [Symbol.dispose](): void {
-    this.dispose();
-  }
-}
-```
+## Snapshots
+
+An agent controlling a GUI needs to see what's on screen, then act on what
+it sees. Screenshots are expensive (~1,500 tokens per image) and imprecise.
+Full AX dumps are overwhelming (5k+ tokens). Snapshots are the middle ground.
+
+`Window.snapshot()` walks the AX tree and produces compact text with numbered
+refs. Each ref maps to a live `Element` handle, so the agent can act on what
+it saw without re-querying.
 
 ### Text format
-
-The snapshot text is a compact, indented tree with one line per meaningful
-element. Each actionable element gets a `[ref=N]` tag:
 
 ```
 window "Spotify" [ref=1]
@@ -2751,2041 +781,244 @@ window "Spotify" [ref=1]
     heading "Made For You" level=1
     list "Playlist Grid"
       cell "Daily Mix 1" [ref=7]
-      cell "Daily Mix 2" [ref=8]
-      cell "Release Radar" [ref=9]
-    scrollbar vertical [ref=10]
+      cell "Release Radar" [ref=8]
 ```
 
-Formatting rules:
-- Indent = nesting depth (2 spaces per level)
-- Skip structural-only groups that add no information
-- Include `value=` for sliders, text fields, checkboxes
-- Include `level=` for headings
-- Only assign refs to actionable elements (buttons, links, text fields,
-  sliders, cells, checkboxes, tabs)
-- Non-actionable text (statictext, headings) shown inline without refs
-- Roles are lowercased without the "AX" prefix for readability
+Rules:
+- One line per meaningful element, indented by tree depth
+- `[ref=N]` only on actionable elements (buttons, links, text fields)
+- ~200-500 tokens for a typical window
 
-### Rust FFI surface
+### The Snapshot entity
 
-```rust
-/// Generate a semantic snapshot of a window's AX tree.
-/// Returns JSON: { "text": "...", "refs": { "1": handle, "2": handle, ... } }
-#[unsafe(no_mangle)]
-pub extern "C" fn casper_window_snapshot(
-    handle: u64,
-    max_depth: u32,
-    web_content_only: u8,
-    include_bounds: u8,
-    skip_roles_json: *const u8, skip_roles_len: u32,
-    out_len: *mut u64,
-) -> *mut u8 {
-    let table = handles::table();
-    let map = table.as_ref().unwrap();
-    let ax = match map.get(&handle) {
-        Some(handles::HandleEntry::Window { ax, .. }) => ax,
-        _ => { unsafe { *out_len = 0; } return ptr::null_mut(); }
-    };
+```typescript
+export class Snapshot implements Disposable {
+  readonly text: string;
+  readonly refs: Map<number, Element>;
 
-    let root = if web_content_only != 0 {
-        // Find the first AXWebArea descendant
-        match ax.find_first(10, &|e| e.role().as_deref() == Some("AXWebArea")) {
-            Some(web_area) => web_area,
-            None => { unsafe { *out_len = 0; } return ptr::null_mut(); }
-        }
-    } else {
-        ax.clone()
-    };
+  async click(ref: number): Promise<void> {
+    const el = this.refs.get(ref);
+    if (!el) throw new Error(`Unknown ref: ${ref}`);
+    await el.click();
+  }
 
-    let mut text = String::new();
-    let mut refs: HashMap<u32, u64> = HashMap::new();
-    let mut next_ref: u32 = 1;
+  async type(ref: number, text: string): Promise<void> {
+    const el = this.refs.get(ref);
+    if (!el) throw new Error(`Unknown ref: ${ref}`);
+    await el.type(text);
+  }
 
-    fn walk(
-        elem: &crate::ax::AXElement,
-        depth: u32, max_depth: u32,
-        text: &mut String, refs: &mut HashMap<u32, u64>,
-        next_ref: &mut u32,
-        include_bounds: bool,
-    ) {
-        if depth > max_depth { return; }
+  get(ref: number): Element {
+    const el = this.refs.get(ref);
+    if (!el) throw new Error(`Unknown ref: ${ref}`);
+    return el;
+  }
 
-        let role = elem.role().unwrap_or_default();
-        let display_role = role.strip_prefix("AX").unwrap_or(&role).to_lowercase();
-        let title = elem.title();
-        let value = elem.value();
-        let indent = "  ".repeat(depth as usize);
+  dispose(): void {
+    for (const el of this.refs.values()) el.dispose();
+    this.refs.clear();
+  }
 
-        let is_actionable = matches!(
-            role.as_str(),
-            "AXButton" | "AXLink" | "AXTextField" | "AXTextArea"
-            | "AXSlider" | "AXCheckBox" | "AXRadioButton"
-            | "AXPopUpButton" | "AXComboBox" | "AXCell"
-            | "AXTab" | "AXMenuItem" | "AXImage"
-            | "AXIncrementor" | "AXDisclosureTriangle"
-        );
-
-        // Build the line
-        let mut line = format!("{}{}", indent, display_role);
-        if let Some(ref t) = title {
-            if !t.is_empty() { line.push_str(&format!(" \"{}\"", t)); }
-        }
-        if let Some(ref v) = value {
-            if !v.is_empty() { line.push_str(&format!(" value={}", v)); }
-        }
-
-        if is_actionable {
-            let ref_id = *next_ref;
-            *next_ref += 1;
-            let elem_handle = handles::insert(handles::HandleEntry::AXElement(elem.clone()));
-            refs.insert(ref_id, elem_handle);
-            line.push_str(&format!(" [ref={}]", ref_id));
-        }
-
-        if include_bounds {
-            if let Some((x, y, w, h)) = elem.frame() {
-                line.push_str(&format!(" @({:.0},{:.0} {:.0}x{:.0})", x, y, w, h));
-            }
-        }
-
-        text.push_str(&line);
-        text.push('\n');
-
-        // Recurse into children
-        for child in elem.children() {
-            walk(&child, depth + 1, max_depth, text, refs, next_ref, include_bounds);
-        }
-    }
-
-    walk(&root, 0, max_depth, &mut text, &mut refs, &mut next_ref, include_bounds != 0);
-
-    let result = serde_json::json!({
-        "text": text,
-        "refs": refs,
-    });
-    json_to_ffi(&result, out_len)
+  [Symbol.dispose](): void { this.dispose(); }
 }
 ```
 
-### Usage in an agent loop
+### Usage
 
 ```typescript
-import { App, Keyboard, shutdown } from "./casper/mod.ts";
+const app = await App.frontmost();
+const win = await app.focusedWindow();
 
-const spotify = await App.find("Spotify");
-await spotify.activate();
-const win = await spotify.focusedWindow();
-
-// Take a semantic snapshot — much cheaper than a screenshot
-{
-  using snap = await win.snapshot();
-
-  // Send snap.text to the LLM as context (~300 tokens vs ~1,500 for an image):
-  //
-  // window "Spotify" [ref=1]
-  //   group "Now Playing Bar"
-  //     statictext "Bohemian Rhapsody"
-  //     statictext "Queen"
-  //     button "Pause" [ref=4]
-  //     button "Next" [ref=5]
-  //     slider "Volume" value=75 [ref=6]
-
-  // LLM responds: "click ref=5 to skip to next track"
-  await snap.click(5);
-
-  // Or get the element for more complex interaction:
-  const volumeSlider = snap.get(6);
-  const props = await volumeSlider.refresh();
-  console.log(`Volume: ${props.value}`);
-
-} // snap.dispose() called — all ref handles released
-```
-
-### Snapshots vs screenshots
-
-Snapshots don't replace screenshots — they complement them. An agent might:
-
-1. Take a **snapshot** for structured understanding (~300 tokens, actionable)
-2. Take a **screenshot** for visual verification (~1,500 tokens, read-only)
-3. Use snapshot refs to **act** without coordinate math
-
-```typescript
-// Snapshot for decision-making
-const snap = await win.snapshot();
-// → Send snap.text to LLM: "I see a Login button [ref=3] and a Sign Up link [ref=4]"
-
-// Screenshot for visual confirmation (optional)
-const png = await win.capture();
-// → Send to multimodal LLM: "Verify the page looks correct"
-
-// Act using snapshot refs (no coordinates needed)
-await snap.click(3);  // Click "Login"
-```
-
-### Web content snapshots
-
-For browser-hosted apps, use `webContentOnly` to skip browser chrome and focus
-on the page:
-
-```typescript
-const safari = await App.find("Safari");
-const win = await safari.focusedWindow();
-
-// Snapshot only the web page content
-const snap = await win.snapshot({ webContentOnly: true });
-// →
-// heading "Twitter / X" level=1
-//   group article [ref=1]
-//     link "@elonmusk" [ref=2]
-//     statictext "This is a tweet"
-//     button "Reply" [ref=3]
-//     button "Retweet" [ref=4]
-//     button "Like" [ref=5]
-//   group article [ref=6]
-//     ...
-
-await snap.click(5); // Like the tweet
+// Snapshot → send to LLM → act on ref
+using snap = await win.snapshot();
+console.log(snap.text);  // send to LLM
+await snap.click(5);     // LLM said "click ref 5"
 ```
 
 ---
 
-## Comparison: Casper vs OpenClaw
+## AppleScript
 
-> [OpenClaw](https://github.com/openclaw/openclaw) (formerly Clawdbot, by Peter
-> Steinberger, 40k+ GitHub stars) is an AI agent gateway that bridges messaging
-> apps to LLMs with the ability to act on your machine. OpenClaw actually uses
-> Peekaboo as its macOS GUI automation layer — Casper would replace/upgrade the
-> automation substrate that OpenClaw sits on top of.
+AX and AppleScript are complementary:
 
-### Architecture comparison
-
-| | **OpenClaw** | **Casper** |
+| | AX | AppleScript |
 |---|---|---|
-| **What it is** | AI agent gateway / orchestrator | Native automation engine |
-| **Core language** | Node.js / TypeScript | Rust (engine) + TypeScript (API) |
-| **How it controls Mac** | Delegates to Peekaboo CLI, AppleScript MCP, CDP | Direct AX handles, AppleScript, CGEvent — all in-process |
-| **Automation model** | CLI subprocess calls (`peekaboo see`, `peekaboo click`) | Entity methods (`element.click()`, `win.find()`) |
-| **State model** | Stateless — every command re-queries the world | Stateful handles — hold live references to AX elements |
-| **Type safety** | Skills are markdown instructions for the LLM | Full TypeScript types — `App`, `Window`, `Element`, `ElementQuery` |
-| **Performance** | Process spawn per action + JSON parsing | FFI call per action, handles avoid re-walking AX tree |
-| **Browser control** | CDP + Semantic Snapshots (ARIA tree → text) | AX tree via `findInPage()` + semantic snapshots |
-| **Knowledge system** | 53 bundled + 5,700 community skills (SKILL.md) | App Profiles (typed, bundled) |
+| **Gives you** | UI structure (buttons, positions) | Semantic verbs (`play track`, `set volume`) |
+| **Works on** | Every GUI app | Only apps with `.sdef` dictionaries |
+| **Speed** | Must walk element tree | Direct command dispatch |
+| **Best for** | Clicking elements, reading layout | App-specific actions, state queries |
 
-### What we borrowed from OpenClaw
-
-**1. Semantic Snapshots** — OpenClaw's browser tool parses the ARIA
-accessibility tree into compact text with element references (`button "Sign In"
-[ref=1]`) instead of sending screenshots. The agent says "click ref=1" — exact,
-cheap, no coordinate guessing. We adopted this as `Window.snapshot()`, with the
-key difference that Casper's refs map to **live Element handles** (not stale
-data), so they track UI changes.
-
-**2. Three-tier lazy loading** — OpenClaw avoids prompt bloat by loading skill
-knowledge progressively: name + description first (~30 tokens), then full
-instructions, then deep reference files. Our App Profiles follow the same
-pattern:
+### The Script entity
 
 ```typescript
-export interface AppProfile {
-  // Tier 1: always loaded (tiny) — name, bundleId, description, scriptable
-  // Tier 2: loaded when agent targets this app — verbs, shortcuts, landmarks
-  // Tier 3: loaded on demand — referenceUrl, exampleFlows
-}
+export const Script = {
+  async tell(appName: string, command: string, opts?: { launchIfNeeded?: boolean }): Promise<string | null> {
+    // → casper_script_tell("Spotify", "play track \"spotify:track:xxx\"", launch)
+  },
+  async eval(source: string): Promise<Record<string, unknown> | string | null> {
+    // → casper_script_eval(source)
+  },
+  async canScript(appName: string): Promise<boolean> {
+    // → casper_script_can_script("Spotify")
+  },
+};
 ```
 
-**3. Permission brokering awareness** — OpenClaw solves macOS TCC
-(Transparency, Consent, and Control) by having a signed GUI app own all
-permissions, brokering requests over a Unix socket. Casper should account for
-running in contexts without TCC grants by supporting PeekabooBridge fallback.
+### Use the best tool for each action
 
-**4. `exec` escape hatch** — Sometimes `osascript -e '...'` or `open -a
-Spotify` is the right call. A lightweight `System.exec()` escape hatch
-prevents over-engineering entity wrappers for one-off operations.
+```
+Scriptable app (Spotify, Safari, Mail)?
+  → Use Script.tell() for semantic actions    ← fast, reliable
+  → Use AX only when you need UI structure    ← clicking custom elements, reading layout
 
-### What makes Casper different
+Non-scriptable app (Electron, random GUI)?
+  → AX only: find → click → type             ← always works
 
-**1. Live handles vs stateless CLI calls** — OpenClaw shells out to `peekaboo
-click --on B3`, spawning a process that walks the AX tree, finds the element,
-clicks, and exits. Every action starts from scratch. Casper's `element.click()`
-reads the live AXUIElement's current frame from a Rust handle table — the
-element was found once and held. This matters for multi-step interactions where
-UI shifts between actions.
+App with an API (Gmail, Obsidian)?
+  → Just use fetch()                          ← it's TypeScript, no abstraction needed
+```
 
-**2. Composable typed API vs interpreted markdown** — OpenClaw skills are prose
-instructions the LLM follows ("to search Spotify, run `peekaboo click --on
-<ref>`"). Casper is typed code that catches errors at write time, enables IDE
-completion, and composes with standard TypeScript control flow.
-
-**3. In-process FFI vs subprocess IPC** — OpenClaw shells out for every
-automation action — process spawn overhead, JSON serialization, stdout parsing.
-Casper calls Rust functions directly through Deno's FFI — microsecond overhead,
-zero serialization for handle-based operations.
-
-**4. Multi-plane coherence** — OpenClaw bolts on AppleScript via a separate MCP
-server (`macos-automator-mcp`). Casper integrates Script, AX, and
-keyboard/mouse as peer entities in a single API — the agent doesn't need to
-know which MCP server to call.
-
-### Summary: what to borrow, what to keep
-
-| Borrow from OpenClaw | Keep in Casper |
-|---|---|
-| Semantic Snapshots — AX tree → text with refs | Live handles — snapshot refs map to real Element handles |
-| Three-tier lazy loading for profiles | Typed profiles — TypeScript interfaces, not markdown |
-| Permission brokering awareness for daemon contexts | In-process FFI — no subprocess overhead |
-| `exec` escape hatch for shell commands | Multi-plane coherence — Script, AX, Input as peers |
-| Skill ecosystem idea — community-contributed profiles | Type-first composability — entities compose with TypeScript |
+No formal "planes" — just use the right tool. Script for scriptable apps.
+AX handles for UI. `fetch` for APIs. They're all available, pick what works.
 
 ---
 
-## Recipes: Skills and CLIs on Top of Entities
+## App Knowledge
 
-Casper's entity model is the foundation — typed, handle-based, composable at
-the language level. But real-world adoption needs three more surfaces:
-
-1. **CLI commands** — so shell scripts and subprocess-based agents (OpenClaw,
-   Claude Code) can call Casper without writing TypeScript
-2. **MCP tools** — so LLM agents can invoke Casper operations via the Model
-   Context Protocol
-3. **Skills** — so LLMs have domain knowledge about *how* to combine operations
-   for specific apps
-
-The question is how to add these without losing type safety. The answer is
-**Recipes** — a middle layer between raw entities and external surfaces.
-
-### The three layers
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Layer 3: Surfaces (how the outside world calls Casper)         │
-│                                                                 │
-│  ┌──────────┐  ┌───────────┐  ┌─────────────┐  ┌───────────┐  │
-│  │  CLI      │  │  MCP Tool │  │  Skill Desc │  │  TS Import│  │
-│  │  casper   │  │  (JSON    │  │  (LLM-      │  │  (direct  │  │
-│  │  play     │  │   schema) │  │   readable  │  │   code)   │  │
-│  │  --uri .. │  │           │  │   markdown) │  │           │  │
-│  └─────┬─────┘  └─────┬─────┘  └──────┬──────┘  └─────┬─────┘  │
-│        │              │               │                │        │
-│  ──────▼──────────────▼───────────────▼────────────────▼─────── │
-│                                                                 │
-│  Layer 2: Recipes (typed functions composing entities)           │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │  spotify.play(uri)                                      │    │
-│  │  spotify.search(query) → Track[]                        │    │
-│  │  spotify.nowPlaying() → TrackInfo                       │    │
-│  │  browser.navigate(url)                                  │    │
-│  │  browser.clickInPage(query)                             │    │
-│  │  finder.copyFile(src, dest)                             │    │
-│  └─────────────────────────┬───────────────────────────────┘    │
-│                            │                                    │
-│  ──────────────────────────▼─────────────────────────────────── │
-│                                                                 │
-│  Layer 1: Entities (typed, handle-based, FFI-backed)            │
-│                                                                 │
-│  App  Window  Element  Script  Keyboard  Mouse  Screen  ...    │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### What is a Recipe?
-
-A Recipe is a **typed TypeScript function** that composes entities to
-accomplish a domain task. It's code, not documentation. It has:
-
-- Typed inputs and outputs (not loose JSON)
-- A decorator/metadata block that generates CLI args, MCP schemas, and skill
-  descriptions from the same source of truth
-- A body that uses entities directly
+For well-known apps, we bundle what we know so agents can skip exploratory
+AX tree walking. Just plain objects:
 
 ```typescript
-// casper/recipes/types.ts
-
-/** Metadata that describes a recipe for external surfaces. */
-export interface RecipeMeta {
-  /** Machine-readable name (used as CLI subcommand and MCP tool name). */
-  name: string;
-
-  /** One-line description for --help and MCP tool listing. */
-  description: string;
-
-  /** Category for grouping in CLI help and skill descriptions. */
-  category: string;
-
-  /** The app profile this recipe targets (optional). */
-  app?: string;
-
-  /** Parameter definitions — single source of truth for CLI args, MCP schema, and JSDoc. */
-  params: Record<string, ParamDef>;
-}
-
-export interface ParamDef {
-  type: "string" | "number" | "boolean";
-  description: string;
-  required?: boolean;
-  default?: unknown;
-  enum?: string[];
-}
-
-/** A recipe is a function plus its metadata. */
-export interface Recipe<TInput, TOutput> {
-  meta: RecipeMeta;
-  execute: (input: TInput) => Promise<TOutput>;
-}
-```
-
-### Example: Spotify recipes
-
-```typescript
-// casper/recipes/spotify.ts
-import { App, Script, Keyboard } from "../entities/mod.ts";
-import { getProfile } from "../profiles/mod.ts";
-import type { Recipe } from "./types.ts";
-
-// --- Types ---
-
-interface PlayInput {
-  uri?: string;
-  query?: string;
-}
-
-interface TrackInfo {
-  artist: string;
-  track: string;
-  album: string;
-  duration: number;
-  position: number;
-  state: string;
-  url: string;
-}
-
-// --- Recipes ---
-
-export const play: Recipe<PlayInput, void> = {
-  meta: {
-    name: "spotify.play",
-    description: "Play a track on Spotify by URI or search query",
-    category: "media",
-    app: "com.spotify.client",
-    params: {
-      uri: { type: "string", description: "Spotify URI (e.g. spotify:track:xxx)" },
-      query: { type: "string", description: "Search query (uses keyboard shortcut)" },
-    },
-  },
-
-  async execute({ uri, query }) {
-    const profile = getProfile("com.spotify.client");
-
-    if (uri && profile?.scriptable) {
-      // Fast path: AppleScript
-      await Script.tell("Spotify", `play track "${uri}"`, { launchIfNeeded: true });
-      return;
-    }
-
-    // Fallback: UI automation
-    const spotify = await App.find("Spotify") ?? await App.launch("com.spotify.client");
-    await spotify.activate();
-    const win = await spotify.focusedWindow();
-
-    if (query) {
-      await Keyboard.hotkey(profile?.shortcuts?.search ?? "cmd+k");
-      const searchField = await win.waitFor({ role: "AXTextField" }, 3000);
-      await searchField.type(query);
-      await Keyboard.press("return");
-      // Wait for results, play top result
-      await new Promise(r => setTimeout(r, 1500));
-      await Keyboard.press("return");
-    } else if (uri) {
-      await Keyboard.hotkey(profile?.shortcuts?.search ?? "cmd+k");
-      const searchField = await win.waitFor({ role: "AXTextField" }, 3000);
-      await searchField.type(uri);
-      await Keyboard.press("return");
-    }
-  },
-};
-
-export const nowPlaying: Recipe<void, TrackInfo> = {
-  meta: {
-    name: "spotify.now-playing",
-    description: "Get the currently playing track on Spotify",
-    category: "media",
-    app: "com.spotify.client",
-    params: {},
-  },
-
-  async execute() {
-    const profile = getProfile("com.spotify.client");
-    if (!profile?.queries?.nowPlaying) {
-      throw new Error("Spotify profile missing nowPlaying query");
-    }
-
-    const result = await Script.eval(`
-      tell application "Spotify"
-        ${profile.queries.nowPlaying}
-      end tell
-    `);
-
-    return result as TrackInfo;
-  },
-};
-
-export const next: Recipe<void, void> = {
-  meta: {
-    name: "spotify.next",
-    description: "Skip to the next track on Spotify",
-    category: "media",
-    app: "com.spotify.client",
-    params: {},
-  },
-
-  async execute() {
-    await Script.tell("Spotify", "next track");
-  },
-};
-
-export const setVolume: Recipe<{ level: number }, void> = {
-  meta: {
-    name: "spotify.volume",
-    description: "Set Spotify playback volume (0-100)",
-    category: "media",
-    app: "com.spotify.client",
-    params: {
-      level: { type: "number", description: "Volume level 0-100", required: true },
-    },
-  },
-
-  async execute({ level }) {
-    const clamped = Math.max(0, Math.min(100, Math.round(level)));
-    await Script.tell("Spotify", `set sound volume to ${clamped}`);
-  },
-};
-```
-
-### Example: Browser recipes
-
-```typescript
-// casper/recipes/browser.ts
-import { App, Script, Keyboard } from "../entities/mod.ts";
-import { getProfile } from "../profiles/mod.ts";
-import type { Recipe } from "./types.ts";
-
-export const navigate: Recipe<{ url: string; app?: string }, void> = {
-  meta: {
-    name: "browser.navigate",
-    description: "Navigate the browser to a URL",
-    category: "browser",
-    params: {
-      url: { type: "string", description: "URL to navigate to", required: true },
-      app: { type: "string", description: "Browser app name (default: Safari)" },
-    },
-  },
-
-  async execute({ url, app = "Safari" }) {
-    const profile = getProfile(app);
-
-    if (profile?.scriptable && profile.verbs?.openUrl) {
-      const verb = typeof profile.verbs.openUrl === "function"
-        ? profile.verbs.openUrl(url)
-        : profile.verbs.openUrl;
-      await Script.tell(app, verb, { launchIfNeeded: true });
-    } else {
-      // Fallback: keyboard shortcut
-      const browser = await App.find(app) ?? await App.launch(app);
-      await browser.activate();
-      await Keyboard.hotkey("cmd+l");
-      await Keyboard.hotkey("cmd+a");
-      await Keyboard.type(url);
-      await Keyboard.press("return");
-    }
-  },
-};
-
-export const currentUrl: Recipe<{ app?: string }, string> = {
-  meta: {
-    name: "browser.current-url",
-    description: "Get the URL of the active browser tab",
-    category: "browser",
-    params: {
-      app: { type: "string", description: "Browser app name (default: Safari)" },
-    },
-  },
-
-  async execute({ app = "Safari" }) {
-    const result = await Script.tell(app, "return URL of current tab of front window");
-    return result ?? "";
-  },
-};
-```
-
-### How recipes become CLI commands
-
-A **CLI adapter** auto-generates Deno subcommands from recipe metadata:
-
-```typescript
-// casper/cli/adapter.ts
-import { parseArgs } from "jsr:@std/cli/parse-args";
-import { registry } from "../recipes/mod.ts";
-
-/**
- * Auto-generate CLI from recipe registry.
- *
- * Usage:
- *   casper spotify.play --uri "spotify:track:xxx"
- *   casper spotify.now-playing
- *   casper spotify.volume --level 75
- *   casper browser.navigate --url "https://example.com"
- */
-export async function runCLI(args: string[]): Promise<void> {
-  const recipeName = args[0];
-  const recipe = registry.get(recipeName);
-
-  if (!recipe) {
-    console.log("Available commands:");
-    for (const [name, r] of registry) {
-      console.log(`  casper ${name.padEnd(30)} ${r.meta.description}`);
-    }
-    Deno.exit(1);
-  }
-
-  // Parse args from recipe param definitions
-  const parsed = parseArgs(args.slice(1), {
-    string: Object.entries(recipe.meta.params)
-      .filter(([_, p]) => p.type === "string")
-      .map(([name]) => name),
-    boolean: Object.entries(recipe.meta.params)
-      .filter(([_, p]) => p.type === "boolean")
-      .map(([name]) => name),
-    default: Object.fromEntries(
-      Object.entries(recipe.meta.params)
-        .filter(([_, p]) => p.default !== undefined)
-        .map(([name, p]) => [name, p.default]),
-    ),
-  });
-
-  // Execute
-  const result = await recipe.execute(parsed);
-  if (result !== undefined) {
-    console.log(JSON.stringify(result, null, 2));
-  }
-}
-```
-
-```
-$ casper spotify.play --uri "spotify:track:4uLU6hMCjMI75M1A2tKUQC"
-$ casper spotify.now-playing
-{"artist":"Queen","track":"Bohemian Rhapsody","album":"A Night at the Opera",...}
-$ casper spotify.volume --level 50
-$ casper browser.navigate --url "https://x.com/elonmusk/status/123"
-```
-
-### How recipes become MCP tools
-
-An **MCP adapter** auto-generates JSON schema and tool handlers from the same
-recipe metadata:
-
-```typescript
-// casper/mcp/adapter.ts
-import { registry } from "../recipes/mod.ts";
-
-/** Convert recipe params to MCP-compatible JSON Schema. */
-function recipeToSchema(meta: RecipeMeta): object {
-  const properties: Record<string, object> = {};
-  const required: string[] = [];
-
-  for (const [name, param] of Object.entries(meta.params)) {
-    properties[name] = {
-      type: param.type,
-      description: param.description,
-      ...(param.enum ? { enum: param.enum } : {}),
-      ...(param.default !== undefined ? { default: param.default } : {}),
-    };
-    if (param.required) required.push(name);
-  }
-
-  return { type: "object", properties, required };
-}
-
-/** Generate MCP tool list from all registered recipes. */
-export function listTools(): object[] {
-  return [...registry.values()].map(recipe => ({
-    name: recipe.meta.name,
-    description: recipe.meta.description,
-    inputSchema: recipeToSchema(recipe.meta),
-  }));
-}
-
-/** Execute an MCP tool call by dispatching to the matching recipe. */
-export async function callTool(name: string, args: Record<string, unknown>): Promise<object> {
-  const recipe = registry.get(name);
-  if (!recipe) throw new Error(`Unknown tool: ${name}`);
-  const result = await recipe.execute(args);
-  return { content: [{ type: "text", text: JSON.stringify(result) }] };
-}
-```
-
-An LLM client (Claude, GPT, etc.) would see:
-
-```json
-{
-  "tools": [
-    {
-      "name": "spotify.play",
-      "description": "Play a track on Spotify by URI or search query",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "uri": { "type": "string", "description": "Spotify URI" },
-          "query": { "type": "string", "description": "Search query" }
-        }
-      }
-    },
-    {
-      "name": "spotify.now-playing",
-      "description": "Get the currently playing track on Spotify",
-      "inputSchema": { "type": "object", "properties": {} }
-    }
-  ]
-}
-```
-
-### How recipes become skill descriptions
-
-A **skill adapter** auto-generates LLM-readable markdown from recipe metadata
-and app profiles. This is what gets injected into an agent's context — not
-the code itself, but a description of what's available.
-
-```typescript
-// casper/skills/adapter.ts
-import { registry } from "../recipes/mod.ts";
-import { getProfile } from "../profiles/mod.ts";
-
-/** Generate a skill description for an app, combining profile + recipes. */
-export function describeSkill(appBundleId: string): string {
-  const profile = getProfile(appBundleId);
-  const recipes = [...registry.values()]
-    .filter(r => r.meta.app === appBundleId);
-
-  if (!profile && recipes.length === 0) return "";
-
-  let md = `## ${profile?.name ?? appBundleId}\n\n`;
-
-  if (profile?.scriptable) {
-    md += `This app is scriptable via AppleScript.\n\n`;
-  }
-
-  if (recipes.length > 0) {
-    md += `### Available actions\n\n`;
-    for (const recipe of recipes) {
-      md += `- **${recipe.meta.name}**: ${recipe.meta.description}\n`;
-      const params = Object.entries(recipe.meta.params);
-      if (params.length > 0) {
-        for (const [name, param] of params) {
-          const req = param.required ? " (required)" : "";
-          md += `  - \`${name}\`: ${param.description}${req}\n`;
-        }
-      }
-    }
-  }
-
-  if (profile?.shortcuts) {
-    md += `\n### Keyboard shortcuts\n\n`;
-    for (const [action, keys] of Object.entries(profile.shortcuts)) {
-      md += `- ${action}: \`${keys}\`\n`;
-    }
-  }
-
-  return md;
-}
-```
-
-An LLM reading this skill description sees:
-
-```markdown
-## Spotify
-
-This app is scriptable via AppleScript.
-
-### Available actions
-
-- **spotify.play**: Play a track on Spotify by URI or search query
-  - `uri`: Spotify URI (e.g. spotify:track:xxx)
-  - `query`: Search query (uses keyboard shortcut)
-- **spotify.now-playing**: Get the currently playing track on Spotify
-- **spotify.next**: Skip to the next track on Spotify
-- **spotify.volume**: Set Spotify playback volume (0-100)
-  - `level`: Volume level 0-100 (required)
-
-### Keyboard shortcuts
-
-- search: `cmd+k`
-- preferences: `cmd+,`
-- newPlaylist: `cmd+n`
-```
-
-### Recipe registry
-
-```typescript
-// casper/recipes/mod.ts
-import type { Recipe } from "./types.ts";
-import * as spotify from "./spotify.ts";
-import * as browser from "./browser.ts";
-
-export const registry = new Map<string, Recipe<any, any>>();
-
-function register(recipe: Recipe<any, any>): void {
-  registry.set(recipe.meta.name, recipe);
-}
-
-// Spotify
-register(spotify.play);
-register(spotify.nowPlaying);
-register(spotify.next);
-register(spotify.setVolume);
-
-// Browser
-register(browser.navigate);
-register(browser.currentUrl);
-
-export { registry };
-```
-
-### How it compares to OpenClaw skills
-
-| | **OpenClaw Skills** | **Casper Recipes** |
-|---|---|---|
-| **Format** | Markdown prose (SKILL.md) | TypeScript functions with metadata |
-| **Execution** | LLM reads docs, generates CLI commands | Recipe function runs directly |
-| **Type safety** | None — LLM might hallucinate args | Full — TypeScript checks inputs/outputs |
-| **Testability** | Manual | Standard unit tests |
-| **Composability** | LLM chains CLI calls in sequence | `await` chains in TypeScript |
-| **CLI exposure** | Already CLI (that's all it is) | Auto-generated from `meta.params` |
-| **MCP exposure** | Separate MCP server per skill | Auto-generated from `meta.params` |
-| **LLM context** | Injected markdown from SKILL.md | Auto-generated from metadata + profile |
-| **Community** | Publish SKILL.md to ClawHub | Publish Deno module to JSR/npm |
-| **Discoverability** | `skills list` shows name + desc | `casper --help` or MCP `listTools` |
-
-The critical difference: OpenClaw skills teach an LLM what CLI commands to
-run. Casper recipes **are** the commands — they execute directly and
-additionally describe themselves to CLIs, MCP, and LLMs from a single source
-of truth.
-
-### Aligning with Peekaboo's existing architecture
-
-Peekaboo already has a three-track tool system:
-
-```
-CLI Command (Commander) → MCPTool (TachikomaMCP) → AgentTool (Tachikoma)
-```
-
-Casper recipes map cleanly onto this:
-
-| Peekaboo layer | Casper equivalent | How it connects |
-|---|---|---|
-| `AsyncRuntimeCommand` | CLI adapter | `casper <recipe.name> --param value` |
-| `MCPTool` protocol | MCP adapter | Auto-generated JSON schema from `meta.params` |
-| `AgentTool` | Direct recipe call | Agent runtime calls `recipe.execute(args)` |
-| `MCPToolContext` | Entity imports | Recipes use entities directly (no DI needed — FFI is global) |
-| `ToolFiltering` | Recipe filtering | Same allow/deny pattern on recipe names |
-| `UISnapshot` + element IDs | `Snapshot` + refs | Same pattern, different implementation |
-
-The key insight: Peekaboo's `MCPTool` structs each contain ~50 lines of
-boilerplate (schema definition, argument parsing, response formatting) that
-is nearly identical across tools. Recipes collapse this: the `meta` block
-generates all three surfaces (CLI, MCP, skill description) automatically.
-
-### Third-party recipes
-
-Because recipes are Deno modules, anyone can publish them:
-
-```typescript
-// Published as: jsr:@someone/casper-slack
-import { App, Script, Keyboard } from "jsr:@peekaboo/casper";
-import type { Recipe } from "jsr:@peekaboo/casper/recipes";
-
-export const sendMessage: Recipe<{ channel: string; message: string }, void> = {
-  meta: {
-    name: "slack.send",
-    description: "Send a message to a Slack channel",
-    category: "communication",
-    app: "com.tinyspeck.slackmacgap",
-    params: {
-      channel: { type: "string", description: "Channel name", required: true },
-      message: { type: "string", description: "Message text", required: true },
-    },
-  },
-
-  async execute({ channel, message }) {
-    const slack = await App.find("Slack") ?? await App.launch("com.tinyspeck.slackmacgap");
-    await slack.activate();
-    await Keyboard.hotkey("cmd+k");  // Quick switcher
-    const win = await slack.focusedWindow();
-    const switcher = await win.waitFor({ role: "AXTextField" }, 3000);
-    await switcher.type(channel);
-    await Keyboard.press("return");
-    await new Promise(r => setTimeout(r, 500));
-    await Keyboard.type(message);
-    await Keyboard.press("return");
-  },
-};
-```
-
-Install and use:
-
-```
-$ deno install jsr:@someone/casper-slack
-$ casper slack.send --channel general --message "Hello from Casper"
-```
-
-Or in agent code:
-
-```typescript
-import { sendMessage } from "jsr:@someone/casper-slack";
-await sendMessage.execute({ channel: "general", message: "Hello from Casper" });
-```
-
-### Recipes with snapshots
-
-Recipes can use snapshots internally for vision-guided automation:
-
-```typescript
-export const likeCurrentTweet: Recipe<void, void> = {
-  meta: {
-    name: "twitter.like",
-    description: "Like the currently visible tweet in the browser",
-    category: "social",
-    params: {},
-  },
-
-  async execute() {
-    const safari = await App.find("Safari");
-    if (!safari) throw new Error("Safari not running");
-    const win = await safari.focusedWindow();
-
-    using snap = await win.snapshot({ webContentOnly: true });
-
-    // Find the first Like button in the snapshot
-    for (const [ref, el] of snap.refs) {
-      const props = await el.refresh();
-      if (props.role === "AXButton" && props.label === "Like") {
-        await snap.click(ref);
-        return;
-      }
-    }
-    throw new Error("No Like button found on page");
-  },
-};
-```
-
-### Recipes with LLM-in-the-loop
-
-For complex tasks where the agent needs to make decisions, a recipe can
-delegate back to the LLM using the snapshot text:
-
-```typescript
-export const interactWithPage: Recipe<{ instruction: string }, string> = {
-  meta: {
-    name: "browser.interact",
-    description: "Perform an instruction on the current web page using vision",
-    category: "browser",
-    params: {
-      instruction: { type: "string", description: "What to do on the page", required: true },
-    },
-  },
-
-  async execute({ instruction }) {
-    const app = await App.frontmost();
-    const win = await app.focusedWindow();
-    using snap = await win.snapshot({ webContentOnly: true });
-
-    // Return the snapshot text — the calling agent decides what ref to act on.
-    // This recipe is a "look, then ask the LLM, then act" pattern.
-    return snap.text;
-
-    // The agent sees the snapshot text, picks a ref, then calls:
-    //   snap.click(ref)  — via a follow-up tool call
-    // This keeps the LLM in the loop for ambiguous situations
-    // while Casper handles the precise execution.
-  },
-};
-```
-
----
-
-## Worked Example: Gmail
-
-Gmail is the ideal worked example because it exposes the hard design
-questions. Unlike Spotify (scriptable, one window, clear verbs) or Finder
-(native, deep AppleScript), Gmail has **four possible automation surfaces**,
-each with different trade-offs:
-
-| Surface | Mechanism | Best for | Limitations |
-|---|---|---|---|
-| **Apple Mail** | Script plane — rich `.sdef` | Read/send/search | Only works if user uses Apple Mail |
-| **Gmail in browser** | Native plane — AX + snapshots | Any browser, no auth needed | Deep AX trees, dynamic loading, fragile selectors |
-| **Gmail in browser + CDP** | Module plane — JS eval | DOM precision, fast batch reads | Requires Chrome/Arc with CDP enabled |
-| **Gmail API** | Module plane — HTTPS REST | Read/send/search/labels — structured data | Requires OAuth token, network |
-
-The right answer isn't one of these — it's **all of them, selected
-automatically** based on what's available.
-
-### The Gmail profile
-
-```typescript
-// casper/profiles/gmail.ts
-import type { AppProfile } from "./types.ts";
-
-/**
- * Gmail is unusual: it's primarily a web app, but many users access it
- * through Apple Mail, or through a Chromium browser where CDP is available.
- * The profile declares all available channels so recipes can pick the best one.
- */
-export const gmail: AppProfile = {
-  // Gmail doesn't have a native bundle ID — it lives inside a browser.
-  // We use a virtual bundle ID that recipes match against.
-  bundleId: "com.google.gmail",
-  name: "Gmail",
-  scriptable: false,  // No AppleScript dictionary (it's a web app)
-
-  shortcuts: {
-    // Gmail's web keyboard shortcuts (must be enabled in Gmail Settings)
-    compose: "c",
-    reply: "r",
-    replyAll: "a",
-    forward: "f",
-    archive: "e",
-    delete: "#",
-    search: "/",
-    nextMessage: "j",
-    prevMessage: "k",
-    openMessage: "o",       // or Enter
-    goToInbox: "g then i",
-    goToSent: "g then t",
-    goToDrafts: "g then d",
-    selectConversation: "x",
-    star: "s",
-    markRead: "shift+i",
-    markUnread: "shift+u",
-    send: "cmd+return",     // macOS-specific
-  },
-
-  landmarks: {
-    // Gmail's AX tree has recognizable landmarks (surprisingly stable)
-    composeButton: { role: "AXButton", descriptionContains: "Compose" },
-    searchBox: { role: "AXTextField", label: "Search mail" },
-    messageList: { role: "AXTable", descriptionContains: "conversations" },
-    messageBody: { role: "AXWebArea" },  // nested inside the message view
-    sendButton: { role: "AXButton", descriptionContains: "Send" },
-    toField: { role: "AXTextField", label: "To" },
-    subjectField: { role: "AXTextField", label: "Subject" },
-    bodyEditor: { role: "AXTextArea", descriptionContains: "Message Body" },
-  },
-
-  modules: {
-    // Gmail doesn't expose a local HTTP server, but we can use:
-    // 1. CDP (if the browser supports it) for DOM-level automation
-    // 2. Gmail API over HTTPS for structured data access
-    cdp: {
-      defaultPort: 9222,
-      launchArgs: ["--remote-debugging-port=9222"],
-    },
-    api: {
-      // OAuth-based Google API — token managed in ~/.casper/tokens/google.json
-      baseUrl: "https://gmail.googleapis.com/gmail/v1",
-      scopes: [
-        "https://www.googleapis.com/auth/gmail.readonly",
-        "https://www.googleapis.com/auth/gmail.send",
-        "https://www.googleapis.com/auth/gmail.modify",
-      ],
-    },
-  },
-};
-
-/**
- * Apple Mail profile — the native client that syncs Gmail via IMAP.
- * If the user has Apple Mail configured with their Gmail account,
- * this is the most reliable automation path.
- */
-export const appleMail: AppProfile = {
-  bundleId: "com.apple.mail",
-  name: "Mail",
+// casper/apps/spotify.ts
+export const spotify = {
+  bundleId: "com.spotify.client",
+  name: "Spotify",
   scriptable: true,
 
   verbs: {
-    newMessage: (to: string, subject: string, body: string) =>
-      `make new outgoing message with properties {subject:"${subject}", content:"${body}", visible:true}`,
-    send: "send theMessage",
-    getInbox: `
-      set msgs to messages of mailbox "INBOX"
-      set result to {}
-      repeat with m in (items 1 thru (min of {20, count of msgs}) of msgs)
-        set end of result to {subject:subject of m, sender:sender of m, dateReceived:date received of m, readStatus:read status of m, id:id of m}
-      end repeat
-      return result
-    `,
-    getMessage: (id: string) => `
-      set m to first message of mailbox "INBOX" whose id is ${id}
-      return {subject:subject of m, sender:sender of m, content:content of m, dateReceived:date received of m}
-    `,
-    search: (query: string) => `
-      set results to (messages of mailbox "INBOX" whose subject contains "${query}" or sender contains "${query}")
-      set output to {}
-      repeat with m in (items 1 thru (min of {10, count of results}) of results)
-        set end of output to {subject:subject of m, sender:sender of m, id:id of m}
-      end repeat
-      return output
-    `,
-    markRead: (id: string) => `set read status of (first message of mailbox "INBOX" whose id is ${id}) to true`,
-    archive: (id: string) => `move (first message of mailbox "INBOX" whose id is ${id}) to mailbox "All Mail"`,
+    play: (uri?: string) => uri ? `play track "${uri}"` : "play",
+    pause: "pause",
+    next: "next track",
+    volume: (n: number) => `set sound volume to ${n}`,
   },
 
-  shortcuts: {
-    newMessage: "cmd+n",
-    reply: "cmd+r",
-    replyAll: "cmd+shift+r",
-    forward: "cmd+shift+f",
-    send: "cmd+shift+d",
-    search: "cmd+opt+f",
-    archive: "ctrl+cmd+a",
-  },
+  shortcuts: { search: "cmd+k", preferences: "cmd+," },
 
   queries: {
-    unreadCount: "return count of (messages of mailbox \"INBOX\" whose read status is false)",
-    inboxCount: "return count of messages of mailbox \"INBOX\"",
-    accountNames: "return name of every account",
-  },
-
-  landmarks: {
-    messageList: { role: "AXTable", identifier: "MessageList" },
-    messageViewer: { role: "AXWebArea" },  // Mail renders HTML emails in a web view
-    searchField: { role: "AXTextField", identifier: "SearchField" },
+    nowPlaying: `
+      set a to artist of current track
+      set t to name of current track
+      return {artist:a, track:t}
+    `,
   },
 };
 ```
 
-### Gmail module: API access
+An agent uses this directly — no framework, no registry:
 
 ```typescript
-// casper/modules/gmail-api.ts
-//
-// Wraps the Gmail REST API. Requires an OAuth token stored at
-// ~/.casper/tokens/google.json (obtained via `casper auth google`).
+import { spotify } from "./apps/spotify.ts";
+import { Script, App, Keyboard } from "./mod.ts";
 
-import { resolve } from "jsr:@std/path";
-
-interface GmailMessage {
-  id: string;
-  threadId: string;
-  snippet: string;
-  from: string;
-  to: string;
-  subject: string;
-  date: string;
-  body: string;
-  labels: string[];
-  unread: boolean;
-}
-
-interface GmailThread {
-  id: string;
-  snippet: string;
-  messages: GmailMessage[];
-}
-
-async function getToken(): Promise<string> {
-  const home = Deno.env.get("HOME")!;
-  const tokenPath = resolve(home, ".casper/tokens/google.json");
-  const data = JSON.parse(await Deno.readTextFile(tokenPath));
-
-  // Check if token is expired and refresh if needed
-  if (data.expiry && Date.now() > data.expiry) {
-    return await refreshToken(data, tokenPath);
+async function playTrack(uri: string) {
+  if (spotify.scriptable) {
+    await Script.tell("Spotify", spotify.verbs.play(uri), { launchIfNeeded: true });
+  } else {
+    const app = await App.launch(spotify.bundleId);
+    await app.activate();
+    const win = await app.focusedWindow();
+    await Keyboard.hotkey(spotify.shortcuts.search);
+    const search = await win.waitFor({ role: "AXTextField" }, 3000);
+    await search.type(uri);
+    await Keyboard.press("return");
   }
-  return data.access_token;
-}
-
-async function refreshToken(data: Record<string, unknown>, path: string): Promise<string> {
-  const res = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      client_id: data.client_id as string,
-      client_secret: data.client_secret as string,
-      refresh_token: data.refresh_token as string,
-      grant_type: "refresh_token",
-    }),
-  });
-  const refreshed = await res.json();
-  const updated = {
-    ...data,
-    access_token: refreshed.access_token,
-    expiry: Date.now() + (refreshed.expires_in * 1000),
-  };
-  await Deno.writeTextFile(path, JSON.stringify(updated, null, 2));
-  return refreshed.access_token;
-}
-
-async function gmailFetch(endpoint: string, opts?: RequestInit): Promise<unknown> {
-  const token = await getToken();
-  const res = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/${endpoint}`, {
-    ...opts,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-      ...opts?.headers,
-    },
-  });
-  if (!res.ok) throw new Error(`Gmail API error: ${res.status} ${await res.text()}`);
-  return res.json();
-}
-
-function decodeBody(payload: Record<string, unknown>): string {
-  // Gmail API returns base64url-encoded bodies
-  const parts = payload.parts as Array<Record<string, unknown>> | undefined;
-  if (parts) {
-    const textPart = parts.find((p) => (p.mimeType as string) === "text/plain");
-    if (textPart) {
-      const data = (textPart.body as Record<string, unknown>).data as string;
-      return atob(data.replace(/-/g, "+").replace(/_/g, "/"));
-    }
-  }
-  const body = payload.body as Record<string, unknown>;
-  if (body?.data) {
-    return atob((body.data as string).replace(/-/g, "+").replace(/_/g, "/"));
-  }
-  return "";
-}
-
-function parseHeaders(headers: Array<{ name: string; value: string }>): Record<string, string> {
-  const map: Record<string, string> = {};
-  for (const h of headers) {
-    map[h.name.toLowerCase()] = h.value;
-  }
-  return map;
-}
-
-function parseMessage(raw: Record<string, unknown>): GmailMessage {
-  const payload = raw.payload as Record<string, unknown>;
-  const headers = parseHeaders(payload.headers as Array<{ name: string; value: string }>);
-  const labels = raw.labelIds as string[] ?? [];
-  return {
-    id: raw.id as string,
-    threadId: raw.threadId as string,
-    snippet: raw.snippet as string,
-    from: headers["from"] ?? "",
-    to: headers["to"] ?? "",
-    subject: headers["subject"] ?? "",
-    date: headers["date"] ?? "",
-    body: decodeBody(payload),
-    labels,
-    unread: labels.includes("UNREAD"),
-  };
-}
-
-// --- Exported functions ---
-
-export async function listInbox(maxResults = 20): Promise<GmailMessage[]> {
-  const data = await gmailFetch(
-    `messages?labelIds=INBOX&maxResults=${maxResults}`
-  ) as { messages: Array<{ id: string }> };
-
-  if (!data.messages?.length) return [];
-
-  // Batch fetch message details
-  const messages = await Promise.all(
-    data.messages.map(async (m) => {
-      const full = await gmailFetch(`messages/${m.id}?format=full`) as Record<string, unknown>;
-      return parseMessage(full);
-    })
-  );
-  return messages;
-}
-
-export async function getMessage(id: string): Promise<GmailMessage> {
-  const full = await gmailFetch(`messages/${id}?format=full`) as Record<string, unknown>;
-  return parseMessage(full);
-}
-
-export async function searchMessages(query: string, maxResults = 10): Promise<GmailMessage[]> {
-  const data = await gmailFetch(
-    `messages?q=${encodeURIComponent(query)}&maxResults=${maxResults}`
-  ) as { messages: Array<{ id: string }> };
-
-  if (!data.messages?.length) return [];
-
-  const messages = await Promise.all(
-    data.messages.map(async (m) => {
-      const full = await gmailFetch(`messages/${m.id}?format=full`) as Record<string, unknown>;
-      return parseMessage(full);
-    })
-  );
-  return messages;
-}
-
-export async function sendMessage(to: string, subject: string, body: string): Promise<string> {
-  const raw = [
-    `To: ${to}`,
-    `Subject: ${subject}`,
-    "Content-Type: text/plain; charset=utf-8",
-    "",
-    body,
-  ].join("\r\n");
-
-  const encoded = btoa(raw).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-
-  const result = await gmailFetch("messages/send", {
-    method: "POST",
-    body: JSON.stringify({ raw: encoded }),
-  }) as { id: string };
-
-  return result.id;
-}
-
-export async function createDraft(to: string, subject: string, body: string): Promise<string> {
-  const raw = [
-    `To: ${to}`,
-    `Subject: ${subject}`,
-    "Content-Type: text/plain; charset=utf-8",
-    "",
-    body,
-  ].join("\r\n");
-
-  const encoded = btoa(raw).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-
-  const result = await gmailFetch("drafts", {
-    method: "POST",
-    body: JSON.stringify({ message: { raw: encoded } }),
-  }) as { id: string };
-
-  return result.id;
-}
-
-export async function replyToMessage(
-  messageId: string,
-  body: string,
-): Promise<string> {
-  const original = await getMessage(messageId);
-
-  const raw = [
-    `To: ${original.from}`,
-    `Subject: Re: ${original.subject}`,
-    `In-Reply-To: ${messageId}`,
-    `References: ${messageId}`,
-    "Content-Type: text/plain; charset=utf-8",
-    "",
-    body,
-    "",
-    `On ${original.date}, ${original.from} wrote:`,
-    ...original.body.split("\n").map((line) => `> ${line}`),
-  ].join("\r\n");
-
-  const encoded = btoa(raw).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-
-  const result = await gmailFetch("messages/send", {
-    method: "POST",
-    body: JSON.stringify({ raw: encoded, threadId: original.threadId }),
-  }) as { id: string };
-
-  return result.id;
-}
-
-export async function markAsRead(messageId: string): Promise<void> {
-  await gmailFetch(`messages/${messageId}/modify`, {
-    method: "POST",
-    body: JSON.stringify({ removeLabelIds: ["UNREAD"] }),
-  });
-}
-
-export async function archive(messageId: string): Promise<void> {
-  await gmailFetch(`messages/${messageId}/modify`, {
-    method: "POST",
-    body: JSON.stringify({ removeLabelIds: ["INBOX"] }),
-  });
-}
-
-export async function getUnreadCount(): Promise<number> {
-  const data = await gmailFetch(
-    "messages?labelIds=INBOX&labelIds=UNREAD&maxResults=1"
-  ) as { resultSizeEstimate: number };
-  return data.resultSizeEstimate;
 }
 ```
-
-### Gmail recipes: multi-plane selection
-
-The recipes are where the planes get selected. Each recipe tries the best
-available path and falls back gracefully:
-
-```typescript
-// casper/recipes/gmail.ts
-import { App, Script, Keyboard, Browser } from "../entities/mod.ts";
-import { getProfile } from "../profiles/mod.ts";
-import * as gmailApi from "../modules/gmail-api.ts";
-import type { Recipe } from "./types.ts";
-
-// --- Types ---
-
-interface EmailSummary {
-  id: string;
-  from: string;
-  subject: string;
-  snippet: string;
-  date: string;
-  unread: boolean;
-}
-
-interface EmailFull {
-  id: string;
-  from: string;
-  to: string;
-  subject: string;
-  date: string;
-  body: string;
-}
-
-// --- Plane detection ---
-
-/** Determine which automation surface is available, in priority order. */
-async function detectGmailPlane(): Promise<"api" | "apple-mail" | "browser"> {
-  // 1. Best: Gmail API token exists → structured data, no UI needed
-  try {
-    const home = Deno.env.get("HOME")!;
-    await Deno.stat(`${home}/.casper/tokens/google.json`);
-    return "api";
-  } catch { /* no token */ }
-
-  // 2. Good: Apple Mail is running and has accounts configured
-  if (await Script.canScript("Mail")) {
-    try {
-      const accounts = await Script.tell("Mail", "return count of accounts");
-      if (accounts && parseInt(accounts) > 0) return "apple-mail";
-    } catch { /* Mail not configured */ }
-  }
-
-  // 3. Fallback: browser automation
-  return "browser";
-}
-
-// --- Recipes ---
-
-export const inbox: Recipe<{ count?: number }, EmailSummary[]> = {
-  meta: {
-    name: "gmail.inbox",
-    description: "List recent inbox messages",
-    category: "email",
-    params: {
-      count: { type: "number", description: "Number of messages (default: 20)" },
-    },
-  },
-
-  async execute({ count = 20 }) {
-    const plane = await detectGmailPlane();
-
-    switch (plane) {
-      case "api": {
-        // Best path: structured data from Gmail API
-        const messages = await gmailApi.listInbox(count);
-        return messages.map((m) => ({
-          id: m.id,
-          from: m.from,
-          subject: m.subject,
-          snippet: m.snippet,
-          date: m.date,
-          unread: m.unread,
-        }));
-      }
-
-      case "apple-mail": {
-        // Good path: AppleScript
-        const raw = await Script.eval(`
-          tell application "Mail"
-            set msgs to messages of mailbox "INBOX"
-            set result to {}
-            repeat with m in (items 1 thru (min of {${count}, count of msgs}) of msgs)
-              set end of result to {subject:subject of m, sender:sender of m, ¬
-                dateReceived:date received of m as string, readStatus:read status of m, ¬
-                id:id of m}
-            end repeat
-            return result
-          end tell
-        `);
-        // Parse AppleScript record list → EmailSummary[]
-        return parseAppleScriptMessages(raw);
-      }
-
-      case "browser": {
-        // Fallback: snapshot the Gmail web UI
-        const browser = await findGmailBrowser();
-        const win = await browser.focusedWindow();
-        using snap = await win.snapshot({ webContentOnly: true, maxDepth: 6 });
-
-        // The snapshot text shows the message list — return it as structured data
-        // by parsing the snapshot refs for table rows
-        return parseGmailSnapshot(snap);
-      }
-    }
-  },
-};
-
-export const readMessage: Recipe<{ id: string }, EmailFull> = {
-  meta: {
-    name: "gmail.read",
-    description: "Read a specific email message",
-    category: "email",
-    params: {
-      id: { type: "string", description: "Message ID", required: true },
-    },
-  },
-
-  async execute({ id }) {
-    const plane = await detectGmailPlane();
-
-    switch (plane) {
-      case "api": {
-        const msg = await gmailApi.getMessage(id);
-        await gmailApi.markAsRead(id);
-        return {
-          id: msg.id,
-          from: msg.from,
-          to: msg.to,
-          subject: msg.subject,
-          date: msg.date,
-          body: msg.body,
-        };
-      }
-
-      case "apple-mail": {
-        const raw = await Script.eval(`
-          tell application "Mail"
-            set m to first message of mailbox "INBOX" whose id is ${id}
-            set read status of m to true
-            return {subject:subject of m, sender:sender of m, ¬
-              content:content of m, dateReceived:date received of m as string, ¬
-              recipientAddr:address of first to recipient of m}
-          end tell
-        `);
-        return parseAppleScriptFullMessage(raw, id);
-      }
-
-      case "browser": {
-        // Click the message row, snapshot the opened message
-        const browser = await findGmailBrowser();
-        const win = await browser.focusedWindow();
-
-        // Navigate to the message by clicking its row
-        using listSnap = await win.snapshot({ webContentOnly: true });
-        const row = findMessageRow(listSnap, id);
-        if (row) await listSnap.click(row);
-
-        // Wait for message to load, then snapshot it
-        await new Promise((r) => setTimeout(r, 1000));
-        using msgSnap = await win.snapshot({ webContentOnly: true, maxDepth: 8 });
-        return parseGmailMessageSnapshot(msgSnap, id);
-      }
-    }
-  },
-};
-
-export const compose: Recipe<{
-  to: string;
-  subject: string;
-  body: string;
-  send?: boolean;
-}, { id: string; status: string }> = {
-  meta: {
-    name: "gmail.compose",
-    description: "Compose and optionally send an email",
-    category: "email",
-    params: {
-      to: { type: "string", description: "Recipient email address", required: true },
-      subject: { type: "string", description: "Email subject", required: true },
-      body: { type: "string", description: "Email body text", required: true },
-      send: { type: "boolean", description: "Send immediately (default: false, saves as draft)" },
-    },
-  },
-
-  async execute({ to, subject, body, send = false }) {
-    const plane = await detectGmailPlane();
-
-    switch (plane) {
-      case "api": {
-        if (send) {
-          const id = await gmailApi.sendMessage(to, subject, body);
-          return { id, status: "sent" };
-        } else {
-          const id = await gmailApi.createDraft(to, subject, body);
-          return { id, status: "draft" };
-        }
-      }
-
-      case "apple-mail": {
-        const sendCmd = send
-          ? "send theMessage"
-          : "";  // Just leave it open as a draft
-        await Script.eval(`
-          tell application "Mail"
-            set theMessage to make new outgoing message with properties ¬
-              {subject:"${escapeAppleScript(subject)}", ¬
-               content:"${escapeAppleScript(body)}", ¬
-               visible:true}
-            tell theMessage
-              make new to recipient at end of to recipients ¬
-                with properties {address:"${escapeAppleScript(to)}"}
-            end tell
-            ${sendCmd}
-          end tell
-        `);
-        return { id: "apple-mail-pending", status: send ? "sent" : "draft" };
-      }
-
-      case "browser": {
-        const browser = await findGmailBrowser();
-        const win = await browser.focusedWindow();
-
-        // Click Compose (or press 'c' if Gmail keyboard shortcuts are enabled)
-        using snap = await win.snapshot({ webContentOnly: true });
-        const composeBtn = findByLandmark(snap, "Compose");
-        if (composeBtn) {
-          await snap.click(composeBtn);
-        } else {
-          await Keyboard.press("c");
-        }
-
-        // Wait for compose window to appear
-        await new Promise((r) => setTimeout(r, 800));
-
-        // Fill in fields — use keyboard navigation since Gmail's compose
-        // window has a predictable tab order: To → Cc → Subject → Body
-        await Keyboard.type(to);
-        await Keyboard.press("tab");
-        // Skip Cc/Bcc
-        await Keyboard.type(subject);
-        await Keyboard.press("tab");
-        await Keyboard.type(body);
-
-        if (send) {
-          await Keyboard.hotkey("cmd+return");  // Gmail's send shortcut
-          return { id: "browser-sent", status: "sent" };
-        }
-
-        // Leave as draft (Gmail auto-saves)
-        return { id: "browser-draft", status: "draft" };
-      }
-    }
-  },
-};
-
-export const reply: Recipe<{
-  id: string;
-  body: string;
-  send?: boolean;
-}, { id: string; status: string }> = {
-  meta: {
-    name: "gmail.reply",
-    description: "Reply to an email message",
-    category: "email",
-    params: {
-      id: { type: "string", description: "Message ID to reply to", required: true },
-      body: { type: "string", description: "Reply text", required: true },
-      send: { type: "boolean", description: "Send immediately (default: false)" },
-    },
-  },
-
-  async execute({ id, body, send = false }) {
-    const plane = await detectGmailPlane();
-
-    switch (plane) {
-      case "api": {
-        if (send) {
-          const replyId = await gmailApi.replyToMessage(id, body);
-          return { id: replyId, status: "sent" };
-        } else {
-          // API doesn't have a clean "reply draft" — create a draft with headers
-          const original = await gmailApi.getMessage(id);
-          const draftId = await gmailApi.createDraft(
-            original.from,
-            `Re: ${original.subject}`,
-            body,
-          );
-          return { id: draftId, status: "draft" };
-        }
-      }
-
-      case "apple-mail": {
-        await Script.eval(`
-          tell application "Mail"
-            set m to first message of mailbox "INBOX" whose id is ${id}
-            set theReply to reply m with opening window
-            set content of theReply to "${escapeAppleScript(body)}" & content of theReply
-            ${send ? "send theReply" : ""}
-          end tell
-        `);
-        return { id: `apple-mail-reply-${id}`, status: send ? "sent" : "draft" };
-      }
-
-      case "browser": {
-        // First open the message
-        await readMessage.execute({ id });
-        await new Promise((r) => setTimeout(r, 500));
-
-        // Press 'r' to reply (Gmail shortcut)
-        await Keyboard.press("r");
-        await new Promise((r) => setTimeout(r, 500));
-
-        // Type the reply
-        await Keyboard.type(body);
-
-        if (send) {
-          await Keyboard.hotkey("cmd+return");
-          return { id: `browser-reply-${id}`, status: "sent" };
-        }
-        return { id: `browser-reply-${id}`, status: "draft" };
-      }
-    }
-  },
-};
-
-export const search: Recipe<{ query: string; count?: number }, EmailSummary[]> = {
-  meta: {
-    name: "gmail.search",
-    description: "Search Gmail messages",
-    category: "email",
-    params: {
-      query: { type: "string", description: "Search query (Gmail syntax)", required: true },
-      count: { type: "number", description: "Max results (default: 10)" },
-    },
-  },
-
-  async execute({ query, count = 10 }) {
-    const plane = await detectGmailPlane();
-
-    switch (plane) {
-      case "api": {
-        const messages = await gmailApi.searchMessages(query, count);
-        return messages.map((m) => ({
-          id: m.id,
-          from: m.from,
-          subject: m.subject,
-          snippet: m.snippet,
-          date: m.date,
-          unread: m.unread,
-        }));
-      }
-
-      case "apple-mail": {
-        const raw = await Script.eval(`
-          tell application "Mail"
-            set results to (messages of mailbox "INBOX" ¬
-              whose subject contains "${escapeAppleScript(query)}" ¬
-              or sender contains "${escapeAppleScript(query)}")
-            set output to {}
-            repeat with m in (items 1 thru (min of {${count}, count of results}) of results)
-              set end of output to {subject:subject of m, sender:sender of m, ¬
-                id:id of m, readStatus:read status of m, ¬
-                dateReceived:date received of m as string}
-            end repeat
-            return output
-          end tell
-        `);
-        return parseAppleScriptMessages(raw);
-      }
-
-      case "browser": {
-        const browser = await findGmailBrowser();
-        const win = await browser.focusedWindow();
-
-        // Focus the search box and type the query
-        await Keyboard.press("/");
-        await new Promise((r) => setTimeout(r, 300));
-        await Keyboard.type(query);
-        await Keyboard.press("return");
-
-        // Wait for results to load
-        await new Promise((r) => setTimeout(r, 1500));
-        using snap = await win.snapshot({ webContentOnly: true, maxDepth: 6 });
-        return parseGmailSnapshot(snap);
-      }
-    }
-  },
-};
-
-export const unreadCount: Recipe<void, number> = {
-  meta: {
-    name: "gmail.unread",
-    description: "Get the number of unread messages in inbox",
-    category: "email",
-    params: {},
-  },
-
-  async execute() {
-    const plane = await detectGmailPlane();
-
-    switch (plane) {
-      case "api":
-        return await gmailApi.getUnreadCount();
-
-      case "apple-mail": {
-        const raw = await Script.tell("Mail",
-          'return count of (messages of mailbox "INBOX" whose read status is false)');
-        return parseInt(raw ?? "0");
-      }
-
-      case "browser": {
-        // Gmail shows unread count in the page title: "Inbox (3) - Gmail"
-        const browser = await findGmailBrowser();
-        const win = await browser.focusedWindow();
-        const title = await win.title();
-        const match = title?.match(/\((\d+)\)/);
-        return match ? parseInt(match[1]) : 0;
-      }
-    }
-  },
-};
-
-// --- Helpers ---
-
-function escapeAppleScript(s: string): string {
-  return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-}
-
-async function findGmailBrowser(): Promise<InstanceType<typeof Browser>> {
-  // Look for any browser with a Gmail tab open
-  for (const appName of ["Safari", "Google Chrome", "Arc", "Firefox"]) {
-    const app = await App.find(appName);
-    if (!app) continue;
-
-    // Check if any window title contains "Gmail" or "Inbox"
-    const windows = await app.windows();
-    for (const win of windows) {
-      const title = await win.title();
-      if (title?.includes("Gmail") || title?.includes("Inbox")) {
-        await app.activate();
-        return app as InstanceType<typeof Browser>;
-      }
-    }
-  }
-
-  // No Gmail tab found — open one
-  const safari = await Browser.findOrLaunch("com.apple.Safari");
-  await Script.tell("Safari", 'open location "https://mail.google.com"');
-  await new Promise((r) => setTimeout(r, 3000));
-  return safari;
-}
-
-function findByLandmark(snap: { refs: Map<number, unknown> }, label: string): number | null {
-  // Search snapshot refs for an element matching the label
-  for (const [ref] of snap.refs) {
-    // Implementation would check the element properties
-    // Simplified here — real impl would use snap.text parsing
-    if (snap.text.includes(`"${label}"`)) return ref;
-  }
-  return null;
-}
-
-function findMessageRow(_snap: unknown, _id: string): number | null {
-  // Parse snapshot to find the row corresponding to a message
-  return null; // Simplified — real impl would parse snapshot refs
-}
-
-// Parser stubs — real implementations would handle AppleScript record
-// format and Gmail's AX tree structure
-function parseAppleScriptMessages(_raw: unknown): EmailSummary[] { return []; }
-function parseAppleScriptFullMessage(_raw: unknown, _id: string): EmailFull {
-  return { id: "", from: "", to: "", subject: "", date: "", body: "" };
-}
-function parseGmailSnapshot(_snap: unknown): EmailSummary[] { return []; }
-function parseGmailMessageSnapshot(_snap: unknown, _id: string): EmailFull {
-  return { id: "", from: "", to: "", subject: "", date: "", body: "" };
-}
-```
-
-### What this looks like from every surface
-
-**CLI:**
-```
-$ casper gmail.inbox --count 5
-[
-  { "id": "abc123", "from": "alice@...", "subject": "Meeting tomorrow", "unread": true },
-  { "id": "def456", "from": "bob@...", "subject": "PR review", "unread": false },
-  ...
-]
-
-$ casper gmail.read --id abc123
-{ "from": "alice@...", "subject": "Meeting tomorrow", "body": "Hi, can we..." }
-
-$ casper gmail.compose --to "alice@example.com" --subject "Re: Meeting" --body "Sure, 2pm works"
-{ "id": "xyz789", "status": "draft" }
-
-$ casper gmail.compose --to "alice@example.com" --subject "Re: Meeting" --body "Sure, 2pm works" --send
-{ "id": "xyz789", "status": "sent" }
-
-$ casper gmail.unread
-3
-```
-
-**MCP tool (what an LLM sees):**
-```json
-{
-  "tools": [
-    {
-      "name": "gmail.inbox",
-      "description": "List recent inbox messages",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "count": { "type": "number", "description": "Number of messages (default: 20)" }
-        }
-      }
-    },
-    {
-      "name": "gmail.read",
-      "description": "Read a specific email message",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "id": { "type": "string", "description": "Message ID" }
-        },
-        "required": ["id"]
-      }
-    },
-    {
-      "name": "gmail.compose",
-      "description": "Compose and optionally send an email",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "to": { "type": "string", "description": "Recipient email address" },
-          "subject": { "type": "string", "description": "Email subject" },
-          "body": { "type": "string", "description": "Email body text" },
-          "send": { "type": "boolean", "description": "Send immediately (default: false, saves as draft)" }
-        },
-        "required": ["to", "subject", "body"]
-      }
-    },
-    {
-      "name": "gmail.reply",
-      "description": "Reply to an email message",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "id": { "type": "string", "description": "Message ID to reply to" },
-          "body": { "type": "string", "description": "Reply text" },
-          "send": { "type": "boolean", "description": "Send immediately (default: false)" }
-        },
-        "required": ["id", "body"]
-      }
-    },
-    {
-      "name": "gmail.search",
-      "description": "Search Gmail messages",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "query": { "type": "string", "description": "Search query (Gmail syntax)" },
-          "count": { "type": "number", "description": "Max results (default: 10)" }
-        },
-        "required": ["query"]
-      }
-    },
-    {
-      "name": "gmail.unread",
-      "description": "Get the number of unread messages in inbox",
-      "inputSchema": { "type": "object", "properties": {} }
-    }
-  ]
-}
-```
-
-**Skill description (injected into agent context):**
-```markdown
-## Gmail
-
-### Available actions
-
-- **gmail.inbox**: List recent inbox messages
-  - `count`: Number of messages (default: 20)
-- **gmail.read**: Read a specific email message
-  - `id`: Message ID (required)
-- **gmail.compose**: Compose and optionally send an email
-  - `to`: Recipient email address (required)
-  - `subject`: Email subject (required)
-  - `body`: Email body text (required)
-  - `send`: Send immediately (default: false, saves as draft)
-- **gmail.reply**: Reply to an email message
-  - `id`: Message ID to reply to (required)
-  - `body`: Reply text (required)
-  - `send`: Send immediately (default: false)
-- **gmail.search**: Search Gmail messages
-  - `query`: Search query — uses Gmail syntax: from:, to:, subject:, has:attachment, etc. (required)
-  - `count`: Max results (default: 10)
-- **gmail.unread**: Get the number of unread messages in inbox
-
-### Tips for agents
-
-- Read before composing: always check inbox or search first to understand context
-- Draft by default: use `send: false` (the default) so the user can review
-- Gmail search syntax: `from:alice`, `is:unread`, `has:attachment`, `newer_than:2d`
-- Reply threading: use `gmail.reply` instead of `gmail.compose` to preserve threads
-```
-
-**Direct TypeScript:**
-```typescript
-import { inbox, readMessage, compose, reply, search } from "jsr:@peekaboo/casper/recipes/gmail";
-
-// Read recent mail
-const messages = await inbox.execute({ count: 5 });
-const unread = messages.filter(m => m.unread);
-
-// Read a specific message
-const msg = await readMessage.execute({ id: unread[0].id });
-console.log(`From: ${msg.from}\nSubject: ${msg.subject}\n\n${msg.body}`);
-
-// Draft a reply
-await reply.execute({
-  id: msg.id,
-  body: "Thanks, I'll review the PR this afternoon.",
-  send: false,  // Just draft it
-});
-
-// Search
-const fromAlice = await search.execute({ query: "from:alice has:attachment" });
-```
-
-### Why this design is better than the alternatives
-
-**vs. a dedicated Gmail MCP server** (e.g., `gmail-mcp-server` on npm):
-A standalone Gmail MCP server only gives you API access. If the user doesn't
-have OAuth configured, it's useless. Casper's multi-plane approach degrades
-gracefully — API > Apple Mail > browser UI — so something always works.
-
-**vs. OpenClaw's Gmail skill** (markdown instructing the LLM to use CLI):
-OpenClaw's skill tells the LLM "use `peekaboo click` on the Compose button."
-This breaks whenever Gmail changes its UI. Casper's recipe uses structured
-API calls when available, and only falls back to UI automation as a last
-resort. The recipe also returns structured data, not screenshots.
-
-**vs. Apple Mail AppleScript only:**
-Not everyone uses Apple Mail. The multi-plane approach works regardless of
-which mail client (or no client) the user has.
-
-### The plane fallback principle
-
-Gmail illustrates a general pattern for all Casper recipes:
-
-```
-1. Module plane (API)    — structured, fast, works headless
-   ↓ (no token / no API)
-2. Script plane          — semantic verbs, reliable for scriptable apps
-   ↓ (app not scriptable / not running)
-3. Native plane (AX/UI)  — always works if we have accessibility permission
-```
-
-Each step down the chain trades precision for universality. The recipe
-encapsulates this decision so the calling code (CLI, MCP, agent) never
-has to think about it.
 
 ---
 
-## File Layout (updated)
+## Usage Examples
+
+### Agent loop
+
+```typescript
+import { App, Screen, Keyboard, shutdown } from "./casper/mod.ts";
+
+const apps = await App.all();
+let safari = await App.find("Safari");
+await safari.activate();
+
+const win = await safari.focusedWindow();
+const png = await win.capture();
+await Deno.writeFile("/tmp/safari.png", png);
+
+const urlBar = await win.find({ role: "AXTextField", identifier: "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD" });
+if (urlBar) {
+  await urlBar.click();
+  await Keyboard.hotkey("cmd+a");
+  await Keyboard.type("https://example.com");
+  await Keyboard.press("return");
+}
+
+await new Promise(r => setTimeout(r, 2000));
+const links = await win.findAll({ role: "AXLink" });
+if (links[0]) await links[0].click();
+
+apps.forEach(a => a.dispose());
+shutdown();
+```
+
+### Snapshot-driven agent
+
+```typescript
+import { App, Script } from "./casper/mod.ts";
+
+const app = await App.frontmost();
+const win = await app.focusedWindow();
+
+using snap = await win.snapshot();
+console.log(snap.text);  // send to LLM
+await snap.click(3);     // LLM picks a ref
+
+// Combine with AppleScript when it helps
+const state = await Script.eval(`
+  tell application "Spotify"
+    return {track:name of current track, artist:artist of current track}
+  end tell
+`);
+```
+
+---
+
+## Handle Flow
+
+```
+1. App.find("Safari")
+   → casper_app_find("Safari")
+   → Rust: NSRunningApplication → AXUIElement → handle=1
+   → TS: new App({ handle: 1, pid: 12345, name: "Safari" })
+
+2. app.windows()
+   → casper_app_windows(handle=1)
+   → Rust: handle 1 → app.ax.windows() → handles 2, 3
+   → TS: [new Window(data, app)]
+
+3. window.find({ role: "AXButton", title: "Submit" })
+   → casper_window_find_all(handle=2, query)
+   → Rust: handle 2 → find_all(query) → handle 4
+   → TS: new Element(data)
+
+4. element.click()
+   → casper_element_click(handle=4)
+   → Rust: handle 4 → frame() → CURRENT position → CGEventPost
+
+5. element.dispose()
+   → casper_release(handle=4) → drops AXUIElement
+```
+
+---
+
+## File Layout
 
 ```
 casper/
@@ -4811,51 +1044,17 @@ casper/
     │   ├── handles.ts            # Handle base class
     │   └── helpers.ts            # pointer/buffer utils
     ├── entities/
-    │   ├── app.ts                # App entity
-    │   ├── window.ts             # Window entity
-    │   ├── element.ts            # Element entity (AX)
-    │   ├── keyboard.ts           # Keyboard singleton
-    │   ├── mouse.ts              # Mouse singleton
-    │   ├── screen.ts             # Screen singleton
-    │   ├── clipboard.ts          # Clipboard singleton
-    │   ├── browser.ts            # Browser extends App
-    │   ├── tab.ts                # Tab entity
-    │   ├── finder.ts             # Finder extends App
-    │   ├── file.ts               # File entity
-    │   ├── dialog.ts             # Dialog entity
-    │   ├── script.ts             # Script singleton (AppleScript)
-    │   └── snapshot.ts           # Snapshot entity (AX tree → text + refs)
-    ├── profiles/
-    │   ├── types.ts              # AppProfile interface
-    │   ├── mod.ts                # Profile registry
-    │   ├── spotify.ts            # Spotify profile
-    │   ├── safari.ts             # Safari profile
-    │   ├── music.ts              # Music profile
-    │   ├── chrome.ts             # Chrome profile (with CDP module config)
-    │   ├── gmail.ts              # Gmail profile (virtual — web app + Apple Mail)
-    │   └── apple-mail.ts         # Apple Mail profile (scriptable native client)
-    ├── modules/                  # Third control plane — protocol-based channels
-    │   ├── cdp.ts                # Chrome DevTools Protocol client (WebSocket)
-    │   ├── gmail-api.ts          # Gmail REST API client (OAuth token managed)
-    │   ├── obsidian.ts           # Obsidian Local REST API
-    │   ├── vscode.ts             # VS Code settings/extensions via filesystem
-    │   ├── docker.ts             # Docker API via Unix domain socket
-    │   ├── defaults.ts           # macOS `defaults` command wrappers
-    │   └── raycast.ts            # Raycast deeplink helpers
-    ├── recipes/
-    │   ├── types.ts              # Recipe<TInput, TOutput> interface
-    │   ├── mod.ts                # Recipe registry
-    │   ├── spotify.ts            # Spotify recipes (play, nowPlaying, next, volume)
-    │   ├── browser.ts            # Browser recipes (navigate, currentUrl — multi-plane)
-    │   └── gmail.ts              # Gmail recipes (inbox, read, compose, reply, search)
-    ├── runtime/
-    │   └── sandbox.ts            # Deno Worker sandbox for third-party recipes
-    ├── cli/
-    │   ├── main.ts               # CLI entry point (Deno.args → recipe dispatch)
-    │   └── adapter.ts            # Recipe → CLI subcommand adapter
-    ├── mcp/
-    │   ├── server.ts             # MCP stdio server (Deno)
-    │   └── adapter.ts            # Recipe → MCP tool adapter
-    └── skills/
-        └── adapter.ts            # Recipe + Profile → LLM-readable markdown
+    │   ├── app.ts
+    │   ├── window.ts
+    │   ├── element.ts
+    │   ├── keyboard.ts
+    │   ├── mouse.ts
+    │   ├── screen.ts
+    │   ├── clipboard.ts
+    │   ├── script.ts
+    │   └── snapshot.ts
+    └── apps/                     # app knowledge (plain objects)
+        ├── spotify.ts
+        ├── safari.ts
+        └── mail.ts
 ```

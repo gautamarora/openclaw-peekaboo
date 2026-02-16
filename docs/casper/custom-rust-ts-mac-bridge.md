@@ -1,5 +1,10 @@
 # Building a TypeScript + Rust Mac Automation Bridge (Deno + FFI)
 
+> **Note:** This document explores a flat, stateless FFI approach. It has been
+> superseded by Casper's entity model (see `casper-entity-design.md`) which
+> adds handle-based state, typed entities, and snapshots on top of the same
+> Deno + Rust FFI foundation described here.
+
 Design document for building your own Mac automation bridge with TypeScript
 (Deno) as the agent orchestrator and Rust as the native layer calling macOS
 APIs directly. Connected via `Deno.dlopen` FFI — no napi-rs, no Node.js, no
