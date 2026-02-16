@@ -1,9 +1,10 @@
 # Casper via WhatsApp: Baileys Socket as Client Transport
 
-> **Exploration.** WhatsApp is just another client. The same TS commands
-> that an agent client issues through `mac_bridge.ts` can be issued from a
-> WhatsApp message handler. Both clients call the same Casper API; the Rust
-> FFI dylib (`libcasper.dylib` via `Deno.dlopen`) is the service.
+> **Exploration.** WhatsApp is just another client. The same Casper entity
+> API (`App`, `Window`, `Element`, `Keyboard`, `Mouse`, `Screen`, etc.)
+> that an agent client uses can be called from a WhatsApp message handler.
+> Both clients import from `casper/mod.ts`; the Rust FFI dylib
+> (`libcasper.dylib` via `Deno.dlopen`) is the service underneath.
 
 ## Architecture
 
@@ -29,17 +30,17 @@
 │             │                             │                   │
 │             ▼                             ▼                   │
 │  ┌────────────────────────────────────────────────────────┐   │
-│  │  Casper TS API  (mac_bridge.ts)                        │   │
+│  │  Casper Entity API  (casper/mod.ts)                    │   │
 │  │                                                        │   │
-│  │  click()  typeText()  hotkey()  captureScreen()        │   │
-│  │  listApplications()  frontmostApplication()  ...       │   │
+│  │  App  Window  Element  Snapshot                        │   │
+│  │  Keyboard  Mouse  Screen  Clipboard  Permissions       │   │
 │  └────────────────────────┬───────────────────────────────┘   │
-│                           │  Deno.dlopen (C ABI)              │
+│                           │  FFI handles + Deno.dlopen        │
 │                           ▼                                   │
 │  ┌────────────────────────────────────────────────────────┐   │
 │  │  Rust: libcasper.dylib                                 │   │
 │  │                                                        │   │
-│  │  ffi.rs → input.rs, ax.rs, capture.rs, apps.rs, ...   │   │
+│  │  ffi.rs → handles.rs, input.rs, ax.rs, capture.rs, ... │   │
 │  └────────────────────────┬───────────────────────────────┘   │
 └───────────────────────────┼───────────────────────────────────┘
                             │
@@ -49,39 +50,51 @@
 └──────────────────────────────────────────────────────────────┘
 ```
 
-The critical point: **there is no separate service process.** The Deno
-process loads `libcasper.dylib` in-process. WhatsApp and agent clients
-are two consumers of the same loaded library, sharing the same handle
-table, the same TCC permissions, the same address space.
+There is no separate service process. The Deno process loads
+`libcasper.dylib` in-process. WhatsApp and agent clients are two consumers
+of the same loaded library, sharing the same handle table, the same TCC
+permissions, the same address space.
 
 ---
 
 ## Why This Works
 
-The Casper FFI bridge (`casper-ffi-bridge.md`) defines a typed TS API in
-`mac_bridge.ts` that wraps `Deno.dlopen` calls. The agent client
-(`client.ts`) imports and calls these functions directly:
+The Casper tech design defines an entity API where everything is an object
+with methods — `App`, `Window`, `Element`, `Keyboard`, `Mouse`, `Screen`.
+The agent client uses it directly:
 
 ```typescript
-// Agent client — from casper-ffi-bridge.md
-import { captureScreen, click, typeText, hotkey } from "./mac_bridge.ts";
+// Agent client
+import { App, Keyboard, Screen } from "./casper/mod.ts";
 
-const screenshot = captureScreen();
-click({ x: 500, y: 300 });
-typeText("hello world");
-hotkey("cmd+s");
+const safari = await App.launch("com.apple.Safari");
+const win = (await safari.windows())[0];
+const buttons = await win.findAll({ role: "AXButton" });
+await buttons[0].click();
+await Keyboard.type("hello world");
+const png = await Screen.capture();
 ```
 
 A WhatsApp client does the exact same thing — it just gets its instructions
 from a Baileys message handler instead of an agent loop:
 
 ```typescript
-// WhatsApp client — same imports, same calls
-import { captureScreen, click, typeText, hotkey } from "./mac_bridge.ts";
+// WhatsApp client — same imports, same entity calls
+import { App, Keyboard, Mouse, Screen, Clipboard, Permissions } from "./casper/mod.ts";
 
 // Baileys message comes in: "screenshot"
-const screenshot = captureScreen();
-// → send screenshot bytes back via sock.sendMessage
+const png = await Screen.capture();
+// → send png bytes back via sock.sendMessage
+
+// Baileys message comes in: "click 500 300"
+await Mouse.click({ x: 500, y: 300 });
+
+// Baileys message comes in: "snap" → "snapclick 5"
+const win = await (await App.frontmost()).focusedWindow();
+const snap = await win.snapshot();
+// → send snap.text as WhatsApp message
+// user replies "snapclick 5"
+await snap.click(5);
 ```
 
 Same API. Same dylib. Different input source.
@@ -98,7 +111,7 @@ Puppeteer, no official API key.
   Runs in the same Deno process as the Casper FFI.
 - **E2EE built-in** — Signal protocol handled transparently.
 - **Rich message types** — can send/receive text, images (PNG/JPEG),
-  documents, reactions, replies. Casper returns screenshots as PNG
+  documents, reactions, replies. Casper entities return screenshots as PNG
   `Uint8Array` — send them directly as image messages.
 - **Event-driven** — `sock.ev.on('messages.upsert', ...)` for incoming
   messages. No polling.
@@ -174,7 +187,7 @@ sock.ev.on("messages.upsert", async ({ messages, type }) => {
 // Text reply
 await sock.sendMessage(jid, { text: "Done." });
 
-// Image reply (PNG bytes from Casper captureScreen)
+// Image reply (PNG bytes from Screen.capture or Window.capture)
 await sock.sendMessage(jid, {
   image: screenshotBuffer,
   caption: "Current screen",
@@ -188,40 +201,85 @@ await sock.sendMessage(jid, { text: "Clicked Submit." }, { quoted: msg });
 
 ## Command Protocol
 
-Plain-text WhatsApp messages map to `mac_bridge.ts` function calls. First
-word is the verb, rest is the argument.
+Plain-text WhatsApp messages map to Casper entity API calls. First word is
+the verb, rest is the argument.
 
 ### Command Table
 
-| WhatsApp message | mac_bridge.ts call | Response |
+| WhatsApp message | Casper entity API call | Response |
 |---|---|---|
-| `screenshot` | `captureScreen()` | PNG image reply |
-| `screenshot <windowId>` | `captureWindow(id)` | PNG image reply |
-| `click 500 300` | `click({ x: 500, y: 300 })` | "Clicked (500, 300)." |
-| `click right 500 300` | `rightClick({ x: 500, y: 300 })` | "Right-clicked (500, 300)." |
-| `dblclick 500 300` | `doubleClick({ x: 500, y: 300 })` | "Double-clicked." |
-| `type hello world` | `typeText("hello world")` | "Typed: hello world" |
-| `hotkey cmd+s` | `hotkey("cmd+s")` | "Pressed cmd+s." |
-| `scroll down` | `scrollDown(3)` | "Scrolled down." |
-| `scroll up 5` | `scrollUp(5)` | "Scrolled up 5." |
-| `apps` | `listApplications()` | Text list of running apps |
-| `frontmost` | `frontmostApplication()` | App name + PID |
-| `activate com.apple.Safari` | `activateApp(...)` | "Activated Safari." |
-| `launch com.apple.TextEdit` | `launchApp(...)` | "Launched TextEdit." |
-| `quit com.apple.TextEdit` | `quitApp(...)` | "Quit TextEdit." |
-| `windows` | `getWindows(frontmostPid)` | Window list |
-| `buttons` | `findElementsByRole(pid, "AXButton")` | Button list |
-| `find AXTextField` | `findElementsByRole(pid, role)` | Element list |
-| `element 500 300` | `elementAtPosition(pid, ...)` | Element info at point |
-| `clipboard` | `readClipboard()` | Clipboard text |
-| `clipboard set <text>` | `writeClipboard(text)` | "Clipboard set." |
-| `permissions` | `checkPermissions()` | Permission status |
-| `drag 100 100 500 500` | `drag(from, to)` | "Dragged." |
-| `move 500 300` | `mouseMove(...)` | "Moved." |
+| `screenshot` | `Screen.capture()` | PNG image reply |
+| `screenshot window` | `win.capture()` | PNG image reply |
+| `snap` | `win.snapshot()` | Snapshot text with `[ref=N]` tags |
+| `snapclick 5` | `snapshot.click(5)` | "Clicked ref 5." |
+| `snaptype 3 hello` | `snapshot.type(3, "hello")` | "Typed into ref 3." |
+| `click 500 300` | `Mouse.click({ x: 500, y: 300 })` | "Clicked (500, 300)." |
+| `dblclick 500 300` | `Mouse.doubleClick({ x: 500, y: 300 })` | "Double-clicked." |
+| `rightclick 500 300` | `Mouse.rightClick({ x: 500, y: 300 })` | "Right-clicked." |
+| `move 500 300` | `Mouse.move({ x: 500, y: 300 })` | "Moved." |
+| `drag 100 100 500 500` | `Mouse.drag(from, to)` | "Dragged." |
+| `scroll down` | `Mouse.scroll("down", 3)` | "Scrolled down." |
+| `scroll up 5` | `Mouse.scroll("up", 5)` | "Scrolled up 5." |
+| `type hello world` | `Keyboard.type("hello world")` | "Typed: hello world" |
+| `hotkey cmd+s` | `Keyboard.hotkey("cmd+s")` | "Pressed cmd+s." |
+| `press return` | `Keyboard.press("return")` | "Pressed return." |
+| `apps` | `App.all()` | Text list of running apps |
+| `frontmost` | `App.frontmost()` | App name + PID |
+| `find Safari` | `App.find("Safari")` | App info |
+| `launch com.apple.TextEdit` | `App.launch(bundleId)` | "Launched TextEdit." |
+| `activate com.apple.Safari` | `app.activate()` | "Activated Safari." |
+| `quit com.apple.Safari` | `app.quit()` | "Quit Safari." |
+| `windows` | `app.windows()` | Window list |
+| `buttons` | `win.findAll({ role: "AXButton" })` | Button list |
+| `fields` | `win.findAll({ role: "AXTextField" })` | Text field list |
+| `findall <role>` | `win.findAll({ role })` | Element list |
+| `clipboard` | `Clipboard.read()` | Clipboard text |
+| `clipboard set <text>` | `Clipboard.write(text)` | "Clipboard set." |
+| `permissions` | `Permissions.check()` | Permission status |
 | `help` | — | Command reference |
 
-Every command maps 1:1 to a `mac_bridge.ts` export. The WhatsApp client
-adds no capabilities beyond what the agent client already has.
+Every command maps to entity methods from `casper/mod.ts`. The WhatsApp
+client calls the same typed API the agent client uses.
+
+---
+
+## Session State
+
+Unlike the agent client (which runs a script and exits), the WhatsApp client
+is a long-lived daemon with conversational interactions. It needs per-chat
+session state to support snapshot workflows and keep references to live
+entities.
+
+```typescript
+import type { Snapshot } from "./casper/mod.ts";
+
+interface ChatSession {
+  snapshot: Snapshot | null;   // last snapshot for this chat (holds live Element handles)
+  app: App | null;             // last-referenced app
+}
+
+const sessions = new Map<string, ChatSession>();
+
+function getSession(jid: string): ChatSession {
+  let session = sessions.get(jid);
+  if (!session) {
+    session = { snapshot: null, app: null };
+    sessions.set(jid, session);
+  }
+  return session;
+}
+
+function disposeSession(jid: string): void {
+  const session = sessions.get(jid);
+  if (session?.snapshot) {
+    session.snapshot.dispose();
+  }
+  sessions.delete(jid);
+}
+```
+
+When a user sends `snap`, the handler creates a snapshot and stores it.
+When they send `snapclick 5`, it looks up that snapshot's ref map.
 
 ---
 
@@ -249,39 +307,23 @@ function parseCommand(text: string): ParsedCommand {
 
 ### Command Handler
 
-This imports `mac_bridge.ts` directly — the same module the agent client
-uses. No IPC, no bridge socket, no separate process.
+This imports from `casper/mod.ts` — the entity API from the tech design.
 
 ```typescript
 // whatsapp_client.ts — WhatsApp command handler
-//
-// Same imports as client.ts in casper-ffi-bridge.md
 
 import {
-  checkPermissions,
-  captureScreen,
-  captureWindow,
-  click,
-  doubleClick,
-  rightClick,
-  mouseMove,
-  typeText,
-  hotkey,
-  scroll,
-  scrollDown,
-  scrollUp,
-  drag,
-  listApplications,
-  frontmostApplication,
-  activateApp,
-  launchApp,
-  quitApp,
-  readClipboard,
-  writeClipboard,
-  getWindows,
-  findElementsByRole,
-  elementAtPosition,
-} from "./mac_bridge.ts";
+  App,
+  Window,
+  Element,
+  Keyboard,
+  Mouse,
+  Screen,
+  Clipboard,
+  Permissions,
+  shutdown,
+  type ElementQuery,
+} from "./casper/mod.ts";
 
 import type { WASocket, WAMessage } from "npm:@whiskeysockets/baileys";
 
@@ -292,18 +334,76 @@ async function handleCommand(
   msg: WAMessage,
 ): Promise<void> {
   const { verb, args, rawArgs } = parseCommand(text);
+  const session = getSession(jid);
 
   switch (verb) {
+    // --- Screen & Window Capture ---
+
     case "screenshot": {
-      const windowId = parseInt(rawArgs[0], 10);
-      const png = isNaN(windowId) ? captureScreen() : captureWindow(windowId);
-      await sock.sendMessage(
-        jid,
-        { image: png, caption: isNaN(windowId) ? "Screen" : `Window ${windowId}` },
-        { quoted: msg },
-      );
+      if (args === "window") {
+        const app = await App.frontmost();
+        const win = await app.focusedWindow();
+        const png = await win.capture();
+        await sock.sendMessage(jid, { image: png, caption: `${app.name} — ${win.title}` }, { quoted: msg });
+      } else {
+        const png = await Screen.capture();
+        await sock.sendMessage(jid, { image: png, caption: "Screen" }, { quoted: msg });
+      }
       break;
     }
+
+    // --- Snapshots (the core workflow for WhatsApp) ---
+
+    case "snap": {
+      // Dispose previous snapshot if any
+      if (session.snapshot) session.snapshot.dispose();
+
+      const app = await App.frontmost();
+      const win = await app.focusedWindow();
+      session.snapshot = await win.snapshot();
+      session.app = app;
+
+      const header = `*${app.name}* — ${win.title}\n\n`;
+      await sock.sendMessage(jid, { text: header + session.snapshot.text }, { quoted: msg });
+      break;
+    }
+
+    case "snapclick": {
+      const ref = parseInt(rawArgs[0], 10);
+      if (isNaN(ref) || !session.snapshot) {
+        await sock.sendMessage(jid, { text: !session.snapshot ? "No snapshot. Send snap first." : "Usage: snapclick <ref>" }, { quoted: msg });
+        break;
+      }
+      await session.snapshot.click(ref);
+      await sock.sendMessage(jid, { text: `Clicked ref ${ref}.` }, { quoted: msg });
+      break;
+    }
+
+    case "snaptype": {
+      const ref = parseInt(rawArgs[0], 10);
+      const typeText = rawArgs.slice(1).join(" ");
+      if (isNaN(ref) || !typeText || !session.snapshot) {
+        await sock.sendMessage(jid, { text: !session.snapshot ? "No snapshot. Send snap first." : "Usage: snaptype <ref> <text>" }, { quoted: msg });
+        break;
+      }
+      await session.snapshot.type(ref, typeText);
+      await sock.sendMessage(jid, { text: `Typed into ref ${ref}.` }, { quoted: msg });
+      break;
+    }
+
+    case "snapref": {
+      const ref = parseInt(rawArgs[0], 10);
+      if (isNaN(ref) || !session.snapshot) {
+        await sock.sendMessage(jid, { text: !session.snapshot ? "No snapshot. Send snap first." : "Usage: snapref <ref>" }, { quoted: msg });
+        break;
+      }
+      const el = session.snapshot.get(ref);
+      const info = `ref ${ref}: ${el.role} "${el.title ?? el.label ?? "?"}" value="${el.value ?? ""}"`;
+      await sock.sendMessage(jid, { text: info }, { quoted: msg });
+      break;
+    }
+
+    // --- Mouse ---
 
     case "click": {
       const [xStr, yStr] = rawArgs;
@@ -313,7 +413,7 @@ async function handleCommand(
         await sock.sendMessage(jid, { text: "Usage: click <x> <y>" }, { quoted: msg });
         break;
       }
-      click({ x, y });
+      await Mouse.click({ x, y });
       await sock.sendMessage(jid, { text: `Clicked (${x}, ${y}).` }, { quoted: msg });
       break;
     }
@@ -326,7 +426,7 @@ async function handleCommand(
         await sock.sendMessage(jid, { text: "Usage: dblclick <x> <y>" }, { quoted: msg });
         break;
       }
-      doubleClick({ x, y });
+      await Mouse.doubleClick({ x, y });
       await sock.sendMessage(jid, { text: `Double-clicked (${x}, ${y}).` }, { quoted: msg });
       break;
     }
@@ -339,39 +439,8 @@ async function handleCommand(
         await sock.sendMessage(jid, { text: "Usage: rightclick <x> <y>" }, { quoted: msg });
         break;
       }
-      rightClick({ x, y });
+      await Mouse.rightClick({ x, y });
       await sock.sendMessage(jid, { text: `Right-clicked (${x}, ${y}).` }, { quoted: msg });
-      break;
-    }
-
-    case "type": {
-      if (!args) {
-        await sock.sendMessage(jid, { text: "Usage: type <text>" }, { quoted: msg });
-        break;
-      }
-      typeText(args);
-      await sock.sendMessage(jid, { text: `Typed: ${args}` }, { quoted: msg });
-      break;
-    }
-
-    case "hotkey": {
-      if (!args) {
-        await sock.sendMessage(jid, { text: "Usage: hotkey <keys> (e.g. cmd+s)" }, { quoted: msg });
-        break;
-      }
-      hotkey(args);
-      await sock.sendMessage(jid, { text: `Pressed ${args}.` }, { quoted: msg });
-      break;
-    }
-
-    case "scroll": {
-      const dir = rawArgs[0]?.toLowerCase() ?? "down";
-      const amount = parseInt(rawArgs[1] ?? "3", 10);
-      if (dir === "up") scrollUp(amount);
-      else if (dir === "down") scrollDown(amount);
-      else if (dir === "left") scroll(amount, 0);
-      else if (dir === "right") scroll(-amount, 0);
-      await sock.sendMessage(jid, { text: `Scrolled ${dir} ${amount}.` }, { quoted: msg });
       break;
     }
 
@@ -382,7 +451,7 @@ async function handleCommand(
         await sock.sendMessage(jid, { text: "Usage: move <x> <y>" }, { quoted: msg });
         break;
       }
-      mouseMove({ x, y });
+      await Mouse.move({ x, y });
       await sock.sendMessage(jid, { text: `Moved to (${x}, ${y}).` }, { quoted: msg });
       break;
     }
@@ -393,37 +462,78 @@ async function handleCommand(
         await sock.sendMessage(jid, { text: "Usage: drag <x1> <y1> <x2> <y2>" }, { quoted: msg });
         break;
       }
-      drag({ x: coords[0], y: coords[1] }, { x: coords[2], y: coords[3] });
-      await sock.sendMessage(jid, { text: `Dragged (${coords[0]},${coords[1]}) → (${coords[2]},${coords[3]}).` }, { quoted: msg });
+      await Mouse.drag({ x: coords[0], y: coords[1] }, { x: coords[2], y: coords[3] });
+      await sock.sendMessage(jid, { text: `Dragged.` }, { quoted: msg });
       break;
     }
 
+    case "scroll": {
+      const dir = rawArgs[0]?.toLowerCase() ?? "down";
+      const amount = parseInt(rawArgs[1] ?? "3", 10);
+      await Mouse.scroll(dir as "up" | "down" | "left" | "right", amount);
+      await sock.sendMessage(jid, { text: `Scrolled ${dir} ${amount}.` }, { quoted: msg });
+      break;
+    }
+
+    // --- Keyboard ---
+
+    case "type": {
+      if (!args) {
+        await sock.sendMessage(jid, { text: "Usage: type <text>" }, { quoted: msg });
+        break;
+      }
+      await Keyboard.type(args);
+      await sock.sendMessage(jid, { text: `Typed: ${args}` }, { quoted: msg });
+      break;
+    }
+
+    case "hotkey": {
+      if (!args) {
+        await sock.sendMessage(jid, { text: "Usage: hotkey <keys> (e.g. cmd+s)" }, { quoted: msg });
+        break;
+      }
+      await Keyboard.hotkey(args);
+      await sock.sendMessage(jid, { text: `Pressed ${args}.` }, { quoted: msg });
+      break;
+    }
+
+    case "press": {
+      if (!args) {
+        await sock.sendMessage(jid, { text: "Usage: press <key> (e.g. return, tab, escape)" }, { quoted: msg });
+        break;
+      }
+      await Keyboard.press(args);
+      await sock.sendMessage(jid, { text: `Pressed ${args}.` }, { quoted: msg });
+      break;
+    }
+
+    // --- App ---
+
     case "apps": {
-      const apps = listApplications();
+      const apps = await App.all();
       const list = apps
         .slice(0, 20)
-        .map((a) => `${a.name ?? a.bundle_id} (pid ${a.pid})`)
+        .map((a) => `${a.name} (${a.bundleId}, pid ${a.pid})`)
         .join("\n");
       await sock.sendMessage(jid, { text: list || "No apps." }, { quoted: msg });
       break;
     }
 
     case "frontmost": {
-      const app = frontmostApplication();
-      const reply = app
-        ? `${app.name} (${app.bundle_id}, pid ${app.pid})`
-        : "No frontmost app.";
-      await sock.sendMessage(jid, { text: reply }, { quoted: msg });
+      const app = await App.frontmost();
+      session.app = app;
+      await sock.sendMessage(jid, { text: `${app.name} (${app.bundleId}, pid ${app.pid})` }, { quoted: msg });
       break;
     }
 
-    case "activate": {
+    case "find": {
       if (!args) {
-        await sock.sendMessage(jid, { text: "Usage: activate <bundleId>" }, { quoted: msg });
+        await sock.sendMessage(jid, { text: "Usage: find <name or bundleId>" }, { quoted: msg });
         break;
       }
-      activateApp(args);
-      await sock.sendMessage(jid, { text: `Activated ${args}.` }, { quoted: msg });
+      const app = await App.find(args);
+      session.app = app;
+      await sock.sendMessage(jid, { text: `${app.name} (${app.bundleId}, pid ${app.pid})` }, { quoted: msg });
       break;
     }
 
@@ -432,139 +542,169 @@ async function handleCommand(
         await sock.sendMessage(jid, { text: "Usage: launch <bundleId>" }, { quoted: msg });
         break;
       }
-      launchApp(args);
-      await sock.sendMessage(jid, { text: `Launched ${args}.` }, { quoted: msg });
+      const app = await App.launch(args);
+      session.app = app;
+      await sock.sendMessage(jid, { text: `Launched ${app.name}.` }, { quoted: msg });
+      break;
+    }
+
+    case "activate": {
+      if (!session.app && !args) {
+        await sock.sendMessage(jid, { text: "Usage: activate <name or bundleId>" }, { quoted: msg });
+        break;
+      }
+      const app = args ? await App.find(args) : session.app!;
+      await app.activate();
+      session.app = app;
+      await sock.sendMessage(jid, { text: `Activated ${app.name}.` }, { quoted: msg });
       break;
     }
 
     case "quit": {
-      if (!args) {
-        await sock.sendMessage(jid, { text: "Usage: quit <bundleId>" }, { quoted: msg });
+      if (!session.app && !args) {
+        await sock.sendMessage(jid, { text: "Usage: quit <name or bundleId>" }, { quoted: msg });
         break;
       }
+      const app = args ? await App.find(args) : session.app!;
       const force = rawArgs.includes("--force");
-      const bundleId = rawArgs.filter((a) => a !== "--force").join(" ");
-      quitApp(bundleId, force);
-      await sock.sendMessage(jid, { text: `Quit ${bundleId}.` }, { quoted: msg });
+      await app.quit(force);
+      await sock.sendMessage(jid, { text: `Quit ${app.name}.` }, { quoted: msg });
       break;
     }
 
+    // --- Window ---
+
     case "windows": {
-      const app = frontmostApplication();
-      if (!app) {
-        await sock.sendMessage(jid, { text: "No frontmost app." }, { quoted: msg });
-        break;
-      }
-      const wins = getWindows(app.pid);
+      const app = session.app ?? await App.frontmost();
+      const wins = await app.windows();
       const list = wins
-        .map((w) => `"${w.title}" (${w.width}x${w.height} at ${w.x},${w.y})`)
+        .map((w) => `"${w.title}" (id ${w.id})`)
         .join("\n");
       await sock.sendMessage(jid, { text: list || "No windows." }, { quoted: msg });
       break;
     }
 
+    case "focus": {
+      const app = session.app ?? await App.frontmost();
+      const win = await app.focusedWindow();
+      await win.focus();
+      await sock.sendMessage(jid, { text: `Focused "${win.title}".` }, { quoted: msg });
+      break;
+    }
+
+    // --- Element queries on the focused window ---
+
     case "buttons": {
-      const app = frontmostApplication();
-      if (!app) {
-        await sock.sendMessage(jid, { text: "No frontmost app." }, { quoted: msg });
-        break;
-      }
-      const buttons = findElementsByRole(app.pid, "AXButton", 8);
+      const app = session.app ?? await App.frontmost();
+      const win = await app.focusedWindow();
+      const buttons = await win.findAll({ role: "AXButton" });
       const list = buttons
         .slice(0, 15)
-        .map((b) => `"${b.title ?? b.label ?? "?"}" at (${b.x}, ${b.y})`)
+        .map((b) => `"${b.title ?? b.label ?? "?"}" at (${b.bounds.x}, ${b.bounds.y})`)
         .join("\n");
       await sock.sendMessage(jid, { text: list || "No buttons." }, { quoted: msg });
       break;
     }
 
-    case "find": {
+    case "fields": {
+      const app = session.app ?? await App.frontmost();
+      const win = await app.focusedWindow();
+      const fields = await win.findAll({ role: "AXTextField" });
+      const list = fields
+        .slice(0, 15)
+        .map((f) => `"${f.title ?? f.label ?? "?"}" value="${f.value ?? ""}" at (${f.bounds.x}, ${f.bounds.y})`)
+        .join("\n");
+      await sock.sendMessage(jid, { text: list || "No text fields." }, { quoted: msg });
+      break;
+    }
+
+    case "findall": {
       const role = rawArgs[0];
       if (!role) {
-        await sock.sendMessage(jid, { text: "Usage: find <AXRole>" }, { quoted: msg });
+        await sock.sendMessage(jid, { text: "Usage: findall <AXRole>" }, { quoted: msg });
         break;
       }
-      const app = frontmostApplication();
-      if (!app) {
-        await sock.sendMessage(jid, { text: "No frontmost app." }, { quoted: msg });
-        break;
-      }
-      const elements = findElementsByRole(app.pid, role, 8);
+      const app = session.app ?? await App.frontmost();
+      const win = await app.focusedWindow();
+      const elements = await win.findAll({ role });
       const list = elements
         .slice(0, 15)
-        .map((e) => `${e.role}: "${e.title ?? e.label ?? "?"}" at (${e.x}, ${e.y})`)
+        .map((e) => `${e.role}: "${e.title ?? e.label ?? "?"}" at (${e.bounds.x}, ${e.bounds.y})`)
         .join("\n");
       await sock.sendMessage(jid, { text: list || `No ${role} elements.` }, { quoted: msg });
       break;
     }
 
-    case "element": {
-      const x = parseFloat(rawArgs[0]);
-      const y = parseFloat(rawArgs[1]);
-      if (isNaN(x) || isNaN(y)) {
-        await sock.sendMessage(jid, { text: "Usage: element <x> <y>" }, { quoted: msg });
-        break;
-      }
-      const app = frontmostApplication();
-      if (!app) {
-        await sock.sendMessage(jid, { text: "No frontmost app." }, { quoted: msg });
-        break;
-      }
-      const el = elementAtPosition(app.pid, { x, y });
-      if (el) {
-        const info = `${el.role}: "${el.title ?? el.label ?? "?"}" value="${el.value ?? ""}" at (${el.x},${el.y} ${el.width}x${el.height})`;
-        await sock.sendMessage(jid, { text: info }, { quoted: msg });
-      } else {
-        await sock.sendMessage(jid, { text: "No element at that position." }, { quoted: msg });
-      }
-      break;
-    }
+    // --- Clipboard ---
 
     case "clipboard": {
       if (rawArgs[0] === "set" && rawArgs.length > 1) {
         const clipText = rawArgs.slice(1).join(" ");
-        writeClipboard(clipText);
-        await sock.sendMessage(jid, { text: `Clipboard set.` }, { quoted: msg });
+        Clipboard.write(clipText);
+        await sock.sendMessage(jid, { text: "Clipboard set." }, { quoted: msg });
       } else {
-        const content = readClipboard();
+        const content = Clipboard.read();
         await sock.sendMessage(jid, { text: content ?? "(empty)" }, { quoted: msg });
       }
       break;
     }
 
+    // --- Permissions ---
+
     case "permissions": {
-      const perms = checkPermissions();
+      const perms = Permissions.check();
       await sock.sendMessage(
         jid,
-        { text: `Accessibility: ${perms.accessibility}\nScreen Recording: ${perms.screen_recording}` },
+        { text: `Accessibility: ${perms.accessibility}\nScreen Recording: ${perms.screenRecording}` },
         { quoted: msg },
       );
       break;
     }
 
+    // --- Help ---
+
     case "help": {
       const help = [
         "*Casper Commands*",
         "",
+        "_Snapshot (inspect → act)_",
+        "snap — snapshot frontmost window AX tree",
+        "snapclick <ref> — click element by ref",
+        "snaptype <ref> <text> — type into element",
+        "snapref <ref> — inspect a ref's properties",
+        "",
+        "_Screen_",
         "screenshot — capture screen",
-        "screenshot <windowId> — capture window",
+        "screenshot window — capture frontmost window",
+        "",
+        "_Mouse_",
         "click <x> <y> — click at coordinates",
         "dblclick <x> <y> — double-click",
         "rightclick <x> <y> — right-click",
-        "type <text> — type text",
-        "hotkey <keys> — press key combo (cmd+s)",
-        "scroll <dir> [amount] — up/down/left/right",
         "move <x> <y> — move mouse",
         "drag <x1> <y1> <x2> <y2> — drag",
+        "scroll <dir> [amount] — up/down/left/right",
+        "",
+        "_Keyboard_",
+        "type <text> — type text",
+        "hotkey <keys> — key combo (cmd+s)",
+        "press <key> — single key (return, tab)",
+        "",
+        "_App_",
         "apps — list running apps",
         "frontmost — frontmost app",
-        "activate <bundleId> — activate app",
+        "find <name> — find app by name",
         "launch <bundleId> — launch app",
-        "quit <bundleId> — quit app",
-        "windows — list frontmost app windows",
-        "buttons — list buttons in frontmost app",
-        "find <AXRole> — find elements by role",
-        "element <x> <y> — inspect element at point",
+        "activate [name] — activate app",
+        "quit [name] — quit app",
+        "",
+        "_Window & Elements_",
+        "windows — list windows",
+        "buttons — list buttons",
+        "fields — list text fields",
+        "findall <AXRole> — find elements by role",
+        "",
+        "_Other_",
         "clipboard — read clipboard",
         "clipboard set <text> — write clipboard",
         "permissions — check TCC status",
@@ -588,10 +728,7 @@ async function handleCommand(
 //
 // deno run --allow-ffi --allow-read --allow-write --allow-net casper-whatsapp.ts
 
-import {
-  checkPermissions,
-  close as closeCasper,
-} from "./mac_bridge.ts";
+import { Permissions, shutdown } from "./casper/mod.ts";
 
 // --- Access control ---
 
@@ -608,10 +745,10 @@ function isAuthorized(msg: WAMessage): boolean {
 // --- Main ---
 
 async function main() {
-  // 1. Verify Casper FFI is loaded and permissions are granted
-  const perms = checkPermissions();
+  // 1. Verify Casper permissions
+  const perms = Permissions.check();
   console.log("Permissions:", perms);
-  if (!perms.accessibility || !perms.screen_recording) {
+  if (!perms.accessibility || !perms.screenRecording) {
     console.error("Missing TCC permissions. Grant in System Settings.");
     Deno.exit(1);
   }
@@ -643,7 +780,11 @@ async function main() {
   });
 
   // Cleanup on exit
-  globalThis.addEventListener("unload", () => closeCasper());
+  globalThis.addEventListener("unload", () => {
+    // Dispose all session snapshots
+    for (const [jid] of sessions) disposeSession(jid);
+    shutdown();
+  });
 }
 
 main();
@@ -665,86 +806,85 @@ deno run --allow-ffi --allow-read --allow-write --allow-net casper-whatsapp.ts
 
 ---
 
+## The Snapshot Workflow
+
+Snapshots are the key interaction pattern over WhatsApp. Coordinates require
+knowing screen positions in advance; snapshots let you *see* the UI and
+*act* on labeled elements from your phone.
+
+```
+You:     snap
+Casper:  *Safari* — Google
+         window "Google" [ref=1]
+           group "Toolbar"
+             button "Back" [ref=2]
+             button "Forward" [ref=3]
+             textfield "Address" value="https://google.com" [ref=4]
+             button "Reload" [ref=5]
+           group "Content"
+             textfield "Search" [ref=6]
+             button "Google Search" [ref=7]
+             button "I'm Feeling Lucky" [ref=8]
+
+You:     snapclick 6
+Casper:  Clicked ref 6.
+
+You:     type weather today
+Casper:  Typed: weather today
+
+You:     press return
+Casper:  Pressed return.
+
+You:     snap
+Casper:  *Safari* — weather today - Google Search
+         window "weather today - Google Search" [ref=1]
+           ...
+```
+
+This is the same `Snapshot` entity from the tech design — `.text` gives the
+compact AX tree with `[ref=N]` tags, `.click(ref)` acts on the live
+`Element` handle behind that ref. The WhatsApp client just renders
+`.text` as a chat message instead of feeding it to an LLM.
+
+---
+
 ## How It Compares to the Agent Client
 
-Both clients are thin shells over the same API. The difference is where
-instructions come from:
+Both clients are thin shells over the same entity API. The difference is
+where instructions come from and where output goes:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        mac_bridge.ts                            │
-│  click()  typeText()  hotkey()  captureScreen()  ...           │
+│  Casper Entity API  (casper/mod.ts)                             │
+│  App  Window  Element  Snapshot  Keyboard  Mouse  Screen  ...  │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
-│   Agent Client (client.ts)     WhatsApp Client (this doc)      │
-│   ─────────────────────────    ──────────────────────────      │
-│   Instructions from:           Instructions from:               │
-│     LLM agent loop               WhatsApp messages             │
-│     (plan → tool call)           (text parse → function call)  │
+│   Agent Client                   WhatsApp Client               │
+│   ────────────                   ───────────────               │
+│   Instructions from:             Instructions from:             │
+│     LLM agent loop                 WhatsApp messages           │
+│     (plan → entity method call)    (text parse → entity call)  │
 │                                                                 │
-│   Output to:                   Output to:                       │
-│     Agent context                WhatsApp reply                 │
-│     (JSON / Uint8Array)          (text / image message)         │
+│   Output to:                     Output to:                     │
+│     Agent context                  WhatsApp reply              │
+│     (Snapshot.text → LLM)          (Snapshot.text → message)   │
+│     (Uint8Array → tool result)     (Uint8Array → image reply)  │
 │                                                                 │
-│   Runs as:                     Runs as:                         │
-│     Script or REPL               Long-lived daemon              │
-│     (execute and exit)           (listen for messages)          │
+│   Runs as:                       Runs as:                       │
+│     Script or REPL                 Long-lived daemon            │
+│     (execute and exit)             (listen for messages)        │
+│                                                                 │
+│   State:                         State:                         │
+│     `using snap = ...`             per-chat session map         │
+│     (scoped to block)             (snapshot + app reference)   │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-There is no protocol translation. No IPC. No serialization beyond what
-`mac_bridge.ts` already does for the FFI boundary. A WhatsApp "click 500 300"
-call resolves to the exact same `symbols.mac_click(500.0, 300.0, 0, 1)` C
-function invocation as `click({ x: 500, y: 300 })` from the agent client.
-
----
-
-## Entity API (Higher-Level)
-
-The command table above maps to the low-level `mac_bridge.ts` API. But the
-Casper tech design defines a richer entity model (`App`, `Window`, `Element`,
-`Snapshot`). The WhatsApp client can use that too:
-
-```typescript
-// Using Casper entity API from WhatsApp
-import { App, Screen, Keyboard, Clipboard } from "./casper/mod.ts";
-
-case "safari": {
-  const safari = await App.find("Safari");
-  await safari.activate();
-  const win = await safari.focusedWindow();
-  const snap = await win.snapshot();
-  // Send the snapshot text as a WhatsApp message
-  await sock.sendMessage(jid, { text: snap.text }, { quoted: msg });
-  break;
-}
-
-case "snap": {
-  const app = await App.frontmost();
-  const win = await app.focusedWindow();
-  using snap = await win.snapshot();
-  await sock.sendMessage(jid, { text: snap.text }, { quoted: msg });
-  break;
-}
-
-case "snapclick": {
-  // "snapclick 5" — click ref 5 in the most recent snapshot
-  const ref = parseInt(rawArgs[0], 10);
-  // (would need to track the last snapshot in session state)
-  await lastSnapshot.click(ref);
-  await sock.sendMessage(jid, { text: `Clicked ref ${ref}.` }, { quoted: msg });
-  break;
-}
-```
-
-This is where WhatsApp becomes a lightweight remote GUI inspector:
-1. Send `snap` → get the AX tree with `[ref=N]` tags
-2. Read the text on your phone, pick a ref
-3. Send `snapclick 5` → click that element
-
-The snapshot text is compact enough (~200-500 tokens) to read comfortably
-in a WhatsApp message.
+The only real difference is session management. The agent client uses
+`using` blocks for snapshot lifetime. The WhatsApp client tracks per-chat
+sessions because the user's interaction is conversational — `snap`, then
+later `snapclick 5` in a separate message.
 
 ---
 
@@ -754,7 +894,7 @@ in a WhatsApp message.
 WhatsApp delivery:     ~200-500ms (E2EE + relay)
 Baileys processing:    ~5-10ms
 Command parsing:       <1ms
-Casper FFI call:       <1ms (direct C function invocation)
+Casper entity call:    <1ms (FFI → C function invocation)
 macOS operation:       ~10-100ms (capture is slowest)
 Response formatting:   <1ms
 WhatsApp reply:        ~200-500ms
@@ -788,6 +928,12 @@ The Deno process needs Accessibility and Screen Recording grants. These are
 the same grants the agent client needs — no additional permissions for the
 WhatsApp transport.
 
+### Handle Cleanup
+
+Snapshot handles hold live Rust-side `AXUIElement` references. The
+`disposeSession` function releases them when a chat goes idle or the
+process exits. Without cleanup, the handle table grows unbounded.
+
 ---
 
 ## File Layout
@@ -795,22 +941,33 @@ WhatsApp transport.
 ```
 casper/
 ├── deno/
-│   ├── mod.ts                  # Deno.dlopen + symbol defs
-│   ├── ffi_helpers.ts          # pointer/buffer utilities
-│   ├── mac_bridge.ts           # typed TS API (shared by all clients)
-│   ├── client.ts               # agent client (from casper-ffi-bridge.md)
+│   ├── casper/
+│   │   ├── mod.ts              # public API re-exports
+│   │   ├── types.ts            # Point, Rect, Size
+│   │   ├── ffi/
+│   │   │   ├── symbols.ts      # Deno.dlopen + symbol defs
+│   │   │   ├── handles.ts      # Handle base class
+│   │   │   └── helpers.ts      # pointer/buffer utilities
+│   │   └── entities/
+│   │       ├── app.ts          # App (handle-based)
+│   │       ├── window.ts       # Window (handle-based)
+│   │       ├── element.ts      # Element (handle-based)
+│   │       ├── snapshot.ts     # Snapshot (holds Element refs)
+│   │       ├── keyboard.ts     # Keyboard (stateless singleton)
+│   │       ├── mouse.ts        # Mouse (stateless singleton)
+│   │       ├── screen.ts       # Screen (stateless singleton)
+│   │       ├── clipboard.ts    # Clipboard (stateless singleton)
+│   │       └── ...
+│   ├── client.ts               # agent client
 │   ├── whatsapp_client.ts      # WhatsApp client (this doc)
 │   ├── casper-whatsapp.ts      # entry point (connect + route)
 │   └── auth_state/             # Baileys session (gitignored)
 └── src/                        # Rust
-    ├── ffi.rs
-    ├── input.rs
-    ├── ax.rs
-    ├── capture.rs
-    ├── apps.rs
-    ├── clipboard.rs
-    └── permissions.rs
+    ├── lib.rs
+    ├── ffi.rs                  # extern "C" entry points
+    ├── handles.rs              # handle table
+    ├── input.rs, ax.rs, capture.rs, apps.rs, ...
 ```
 
-Both `client.ts` and `whatsapp_client.ts` import from the same
-`mac_bridge.ts`. The Rust crate is built once and loaded once.
+Both `client.ts` and `whatsapp_client.ts` import from `casper/mod.ts`.
+The Rust crate is built once and loaded once.
