@@ -1990,6 +1990,494 @@ async function playTrack(uri: string): Promise<void> {
 
 ---
 
+## Deno Modules: The Third Control Plane
+
+The Hybrid Control section above shows that real automation mixes AX, Script,
+and external API calls. But those API calls were left vague — "Tachikoma
+providers or direct `fetch` calls in agent code." Deno modules formalize this
+as a first-class control plane alongside Native and Script.
+
+### Why three planes?
+
+Each plane reaches apps through a different mechanism, and each has a domain
+where it's the only reliable option:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        Casper Control Planes                           │
+│                                                                        │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────────┐ │
+│  │  Native (Rust)   │  │  Script          │  │  Module (Deno)       │ │
+│  │                  │  │  (AppleScript)   │  │                      │ │
+│  │  AX handles      │  │  .sdef verbs     │  │  HTTP/WS APIs        │ │
+│  │  CGEvent input   │  │  System Events   │  │  CDP protocol        │ │
+│  │  Screen capture  │  │  Finder ops      │  │  File watchers       │ │
+│  │  Window geometry │  │  `open` URLs     │  │  IPC sockets         │ │
+│  │  Process info    │  │  Batch scripting  │  │  Cross-app glue      │ │
+│  │                  │  │                  │  │  Plugin hosting       │ │
+│  └────────┬─────────┘  └────────┬─────────┘  └──────────┬───────────┘ │
+│           │                     │                        │             │
+│           │     Rust FFI        │    NSAppleScript FFI   │   Native    │
+│           │    Deno.dlopen()    │   casper_script_tell() │  Deno APIs  │
+│           │                     │                        │   (fetch,   │
+│           │                     │                        │  WebSocket, │
+│           │                     │                        │  Deno.open) │
+│           └─────────────────────┴────────────────────────┘             │
+│                                 │                                      │
+│                          Entity Layer                                  │
+│              App  Window  Element  Script  Keyboard  ...               │
+│                                                                        │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+| | **Native** | **Script** | **Module** |
+|---|---|---|---|
+| **Mechanism** | AX API, CGEvent, NSWorkspace | AppleScript/JXA via NSAppleScript | HTTP, WebSocket, CDP, files, IPC |
+| **What it reaches** | Every GUI app (even unsigned) | Apps with `.sdef` scripting dictionaries | Apps with local servers, APIs, or config files |
+| **Best for** | UI discovery, clicking, typing, reading layout | Semantic verbs, batch operations, state queries | API-driven actions, browser devtools, file/config ops |
+| **Speed** | Fast (in-process FFI) | Fast (in-process FFI) | Varies (local HTTP is fast, network APIs add latency) |
+| **Reliability** | Depends on AX tree quality | Very stable for scriptable apps | Very stable (structured protocols) |
+| **Requires** | Accessibility TCC grant | Accessibility or Automation TCC | Usually nothing (local HTTP is sandboxed) |
+
+### What Deno modules unlock
+
+**1. Local HTTP APIs** — Many modern Mac apps expose local REST or WebSocket
+servers for automation:
+
+```typescript
+// casper/modules/raycast.ts — Raycast deeplinks via HTTP
+export async function runCommand(extensionName: string, command: string): Promise<void> {
+  // Raycast exposes a deeplink protocol
+  await Script.eval(`open location "raycast://extensions/${extensionName}/${command}"`);
+}
+
+// casper/modules/obsidian.ts — Obsidian Local REST API plugin
+export async function createNote(vault: string, path: string, content: string): Promise<void> {
+  const port = await readObsidianPort(vault); // reads from plugin config
+  await fetch(`http://127.0.0.1:${port}/vault/${encodeURIComponent(path)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "text/markdown", Authorization: `Bearer ${await readApiKey(vault)}` },
+    body: content,
+  });
+}
+
+// casper/modules/homeassistant.ts — Home Assistant local API
+export async function turnOn(entityId: string): Promise<void> {
+  await fetch("http://homeassistant.local:8123/api/services/homeassistant/turn_on", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${await readHAToken()}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ entity_id: entityId }),
+  });
+}
+```
+
+**2. Chrome DevTools Protocol (CDP)** — Deep browser automation beyond what
+AX provides. Arc, Chrome, Edge, and Brave all expose CDP over a WebSocket
+when launched with `--remote-debugging-port`:
+
+```typescript
+// casper/modules/cdp.ts
+export class CDPSession {
+  private ws: WebSocket;
+  private nextId = 1;
+  private pending = new Map<number, { resolve: Function; reject: Function }>();
+
+  static async connect(port = 9222): Promise<CDPSession> {
+    // Discover the WebSocket URL from the JSON endpoint
+    const res = await fetch(`http://127.0.0.1:${port}/json/version`);
+    const { webSocketDebuggerUrl } = await res.json();
+    const ws = new WebSocket(webSocketDebuggerUrl);
+    await new Promise((resolve, reject) => {
+      ws.onopen = resolve;
+      ws.onerror = reject;
+    });
+    return new CDPSession(ws);
+  }
+
+  private constructor(ws: WebSocket) {
+    this.ws = ws;
+    this.ws.onmessage = (event) => {
+      const msg = JSON.parse(event.data as string);
+      if (msg.id && this.pending.has(msg.id)) {
+        const { resolve, reject } = this.pending.get(msg.id)!;
+        this.pending.delete(msg.id);
+        if (msg.error) reject(new Error(msg.error.message));
+        else resolve(msg.result);
+      }
+    };
+  }
+
+  async send(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+      this.ws.send(JSON.stringify({ id, method, params }));
+    });
+  }
+
+  /** Navigate to a URL and wait for load. */
+  async navigate(url: string): Promise<void> {
+    await this.send("Page.navigate", { url });
+    await this.send("Page.enable");
+    // Could wait for Page.loadEventFired here
+  }
+
+  /** Execute JavaScript in the page context. */
+  async evaluate(expression: string): Promise<unknown> {
+    const result = await this.send("Runtime.evaluate", {
+      expression,
+      returnByValue: true,
+    }) as { result: { value: unknown } };
+    return result.result.value;
+  }
+
+  /** Get the DOM as accessible text (like Semantic Snapshots but from CDP). */
+  async getAccessibilityTree(): Promise<unknown> {
+    return await this.send("Accessibility.getFullAXTree");
+  }
+
+  /** Click an element by CSS selector. */
+  async click(selector: string): Promise<void> {
+    await this.evaluate(`document.querySelector(${JSON.stringify(selector)}).click()`);
+  }
+
+  /** Type into the focused element. */
+  async type(text: string): Promise<void> {
+    for (const char of text) {
+      await this.send("Input.dispatchKeyEvent", {
+        type: "keyDown", text: char, key: char,
+      });
+      await this.send("Input.dispatchKeyEvent", {
+        type: "keyUp", text: char, key: char,
+      });
+    }
+  }
+
+  close(): void {
+    this.ws.close();
+  }
+}
+```
+
+This complements AX-based browser automation — CDP gives you DOM-level
+precision (CSS selectors, JS evaluation, network interception), while AX
+gives you the native chrome (address bar, tab strip, browser menus):
+
+```typescript
+// Use AX for the browser shell
+const safari = await Browser.findOrLaunch("com.google.Chrome");
+const win = await safari.focusedWindow();
+const addressBar = await win.find({ role: "AXTextField", identifier: "address" });
+
+// Use CDP for page content
+const cdp = await CDPSession.connect(9222);
+await cdp.navigate("https://example.com");
+const title = await cdp.evaluate("document.title");
+await cdp.click("#login-button");
+await cdp.type("my-username");
+```
+
+**3. Unix domain sockets / IPC** — Some apps expose automation via Unix
+sockets (Docker, VS Code extension host, various daemons):
+
+```typescript
+// casper/modules/docker.ts — Docker API via Unix socket
+export async function listContainers(): Promise<unknown[]> {
+  // Deno supports Unix domain sockets via Deno.connect
+  const conn = await Deno.connect({ path: "/var/run/docker.sock", transport: "unix" });
+
+  const request = new TextEncoder().encode(
+    "GET /v1.44/containers/json HTTP/1.1\r\nHost: localhost\r\n\r\n"
+  );
+  await conn.write(request);
+
+  const buf = new Uint8Array(65536);
+  const n = await conn.read(buf);
+  conn.close();
+
+  const response = new TextDecoder().decode(buf.subarray(0, n!));
+  const body = response.split("\r\n\r\n")[1];
+  return JSON.parse(body);
+}
+```
+
+**4. File system as an API** — Many apps store state in known locations.
+Reading/writing these files is automation too:
+
+```typescript
+// casper/modules/vscode.ts — Read VS Code settings
+export async function getSettings(): Promise<Record<string, unknown>> {
+  const home = Deno.env.get("HOME")!;
+  const settingsPath = `${home}/Library/Application Support/Code/User/settings.json`;
+  const text = await Deno.readTextFile(settingsPath);
+  return JSON.parse(text);
+}
+
+export async function updateSetting(key: string, value: unknown): Promise<void> {
+  const settings = await getSettings();
+  settings[key] = value;
+  const home = Deno.env.get("HOME")!;
+  const settingsPath = `${home}/Library/Application Support/Code/User/settings.json`;
+  await Deno.writeTextFile(settingsPath, JSON.stringify(settings, null, 2));
+}
+
+// casper/modules/defaults.ts — macOS defaults (plist) wrappers
+export async function read(domain: string, key: string): Promise<string> {
+  const cmd = new Deno.Command("defaults", { args: ["read", domain, key] });
+  const { stdout } = await cmd.output();
+  return new TextDecoder().decode(stdout).trim();
+}
+
+export async function write(domain: string, key: string, type: string, value: string): Promise<void> {
+  const cmd = new Deno.Command("defaults", { args: ["write", domain, key, `-${type}`, value] });
+  await cmd.output();
+}
+```
+
+### How Module fits the entity model
+
+Modules don't replace entities — they **extend** specific entities with
+richer capabilities when a protocol-based channel is available. The pattern:
+
+```typescript
+// casper/entities/browser.ts — Browser entity gains a CDP accessor
+export class Browser extends App {
+  private _cdp?: CDPSession;
+
+  /** Get a CDP session for deep page automation. Requires --remote-debugging-port. */
+  async cdp(port = 9222): Promise<CDPSession> {
+    if (!this._cdp) {
+      this._cdp = await CDPSession.connect(port);
+    }
+    return this._cdp;
+  }
+
+  // Existing methods still work:
+  // focusedWindow(), find(), activate(), etc.
+}
+
+// Usage — mix freely:
+const chrome = await Browser.findOrLaunch("com.google.Chrome");
+const win = await chrome.focusedWindow();             // Native plane
+const addressUrl = await win.find({ role: "AXTextField" }); // Native plane
+
+const cdp = await chrome.cdp();                        // Module plane
+await cdp.navigate("https://example.com");             // Module plane
+const pageTitle = await cdp.evaluate("document.title");// Module plane
+
+await Keyboard.hotkey("cmd+l");                        // Native plane (input)
+```
+
+### How Module fits the profile model
+
+App profiles gain a `modules` section declaring what protocol-based channels
+are available:
+
+```typescript
+export interface AppProfile {
+  bundleId: string;
+  name: string;
+  scriptable: boolean;
+
+  verbs?: Record<string, string | ((...args: unknown[]) => string)>;
+  shortcuts?: Record<string, string>;
+  queries?: Record<string, string>;
+  landmarks?: Record<string, ElementQuery>;
+
+  // New: module capabilities
+  modules?: {
+    /** App exposes CDP when launched with --remote-debugging-port. */
+    cdp?: { defaultPort: number; launchArgs?: string[] };
+    /** App exposes a local HTTP API. */
+    http?: { port: number | (() => Promise<number>); basePath?: string };
+    /** App exposes a Unix domain socket. */
+    socket?: { path: string };
+    /** App stores config/state in known file locations. */
+    files?: Record<string, string>;  // logical name → path template
+  };
+}
+```
+
+Example — Chrome profile with CDP:
+
+```typescript
+export const chrome: AppProfile = {
+  bundleId: "com.google.Chrome",
+  name: "Chrome",
+  scriptable: true,
+
+  verbs: {
+    openUrl: (url: string) => `open location "${url}"`,
+    currentUrl: "return URL of active tab of front window",
+  },
+
+  shortcuts: {
+    addressBar: "cmd+l",
+    newTab: "cmd+t",
+    devTools: "cmd+opt+i",
+  },
+
+  landmarks: {
+    addressBar: { role: "AXTextField", identifier: "address" },
+    webContent: { role: "AXWebArea" },
+  },
+
+  modules: {
+    cdp: {
+      defaultPort: 9222,
+      launchArgs: ["--remote-debugging-port=9222"],
+    },
+    files: {
+      settings: "${HOME}/Library/Application Support/Google/Chrome/Default/Preferences",
+      bookmarks: "${HOME}/Library/Application Support/Google/Chrome/Default/Bookmarks",
+    },
+  },
+};
+```
+
+### Plane selection logic
+
+When a recipe needs to perform an action, it selects the best plane:
+
+```typescript
+// casper/recipes/browser.ts — navigate uses the best available plane
+
+export const navigate: Recipe<{ url: string; app?: string }, void> = {
+  meta: {
+    name: "browser.navigate",
+    description: "Navigate the browser to a URL",
+    category: "browser",
+    params: {
+      url: { type: "string", description: "URL to navigate to", required: true },
+      app: { type: "string", description: "Browser app name" },
+    },
+  },
+
+  async execute({ url, app = "Safari" }) {
+    const profile = getProfile(app);
+    const browser = await Browser.findOrLaunch(profile?.bundleId ?? app);
+
+    // Priority 1: CDP if available (most precise for page navigation)
+    if (profile?.modules?.cdp) {
+      try {
+        const cdp = await browser.cdp(profile.modules.cdp.defaultPort);
+        await cdp.navigate(url);
+        return;
+      } catch {
+        // CDP not running — fall through
+      }
+    }
+
+    // Priority 2: AppleScript if scriptable (fast, reliable)
+    if (profile?.scriptable && profile.verbs?.openUrl) {
+      const verb = typeof profile.verbs.openUrl === "function"
+        ? profile.verbs.openUrl(url) : profile.verbs.openUrl;
+      await Script.tell(app, verb);
+      return;
+    }
+
+    // Priority 3: AX automation (always works if we have TCC)
+    await browser.activate();
+    await Keyboard.hotkey(profile?.shortcuts?.addressBar ?? "cmd+l");
+    await Keyboard.hotkey("cmd+a");
+    await Keyboard.type(url);
+    await Keyboard.press("return");
+  },
+};
+```
+
+### What makes Deno particularly good here
+
+**`Deno.dlopen`** — Casper already uses this for Rust FFI. The same mechanism
+lets module authors call other native libraries without Node-API boilerplate:
+
+```typescript
+// Hypothetical: talk to a DAW's C API
+const lib = Deno.dlopen("/Applications/Logic Pro.app/Contents/Frameworks/CoreAudio.framework/CoreAudio", {
+  getTransportState: { parameters: [], result: "i32" },
+});
+```
+
+**Permission model** — Third-party recipes run with Deno's granular permissions.
+A Spotify recipe only needs `--allow-net=127.0.0.1:4370` (Spotify's local
+HTTPS server). A file-reading module needs `--allow-read=/path/to/config`.
+The host can enforce least-privilege:
+
+```typescript
+// casper/runtime/sandbox.ts
+export async function runThirdPartyRecipe(
+  recipePath: string,
+  args: Record<string, unknown>,
+  permissions: Deno.PermissionOptions,
+): Promise<unknown> {
+  // Run in a Deno worker with restricted permissions
+  const worker = new Worker(new URL(recipePath, import.meta.url), {
+    type: "module",
+    deno: {
+      permissions: {
+        net: permissions.net ?? false,   // no network by default
+        read: permissions.read ?? false, // no file reads by default
+        write: false,                    // never write by default
+        run: false,                      // never spawn by default
+        ffi: false,                      // never FFI by default (only core Casper)
+        env: false,                      // no env access by default
+      },
+    },
+  });
+
+  // Message-passing interface to the recipe
+  worker.postMessage({ type: "execute", args });
+  return new Promise((resolve, reject) => {
+    worker.onmessage = (e) => {
+      if (e.data.type === "result") resolve(e.data.value);
+      if (e.data.type === "error") reject(new Error(e.data.message));
+      worker.terminate();
+    };
+  });
+}
+```
+
+**JSR ecosystem** — Module authors publish to JSR (Deno's registry) with full
+TypeScript types. Users install with `deno add`, and the module shows up as
+recipes automatically:
+
+```
+$ deno add jsr:@casper/obsidian
+$ casper obsidian.create-note --vault "My Vault" --path "daily/today.md" --content "# Today"
+```
+
+**`deno compile`** — The entire Casper CLI (entities + recipes + modules)
+compiles to a single binary. No Node.js, no npm, no `node_modules`.
+
+### Comparison: Planes × surfaces
+
+Each plane can be exposed through any surface (CLI, MCP, skill, direct code):
+
+```
+                    ┌─────────┬──────────┬─────────────┬────────────┐
+                    │   CLI   │   MCP    │  Skill Desc │  TS Import │
+┌───────────────────┼─────────┼──────────┼─────────────┼────────────┤
+│ Native (AX/Input) │ casper  │ JSON     │ "click the  │ element    │
+│                   │ click   │ schema   │  Save btn"  │ .click()   │
+│                   │ --query │          │             │            │
+├───────────────────┼─────────┼──────────┼─────────────┼────────────┤
+│ Script            │ casper  │ JSON     │ "tell       │ Script     │
+│ (AppleScript)     │ spotify │ schema   │  Spotify    │ .tell()    │
+│                   │ .play   │          │  to play"   │            │
+├───────────────────┼─────────┼──────────┼─────────────┼────────────┤
+│ Module            │ casper  │ JSON     │ "create     │ obsidian   │
+│ (Deno)            │ obsidian│ schema   │  a note in  │ .create    │
+│                   │ .create │          │  Obsidian"  │ Note()     │
+└───────────────────┴─────────┴──────────┴─────────────┴────────────┘
+```
+
+The recipe layer normalizes all three planes into the same external interface.
+The calling code (CLI, MCP, agent) never needs to know which plane a recipe
+uses internally — it just calls `recipe.execute(args)` and the recipe picks
+the best plane for the job.
+
+---
+
 ## Web Content Extensions
 
 Browser-hosted apps (Twitter/X, Gmail, Slack web) present challenges that
@@ -3268,12 +3756,22 @@ casper/
     │   ├── mod.ts                # Profile registry
     │   ├── spotify.ts            # Spotify profile
     │   ├── safari.ts             # Safari profile
-    │   └── music.ts              # Music profile
+    │   ├── music.ts              # Music profile
+    │   └── chrome.ts             # Chrome profile (with CDP module config)
+    ├── modules/                  # Third control plane — protocol-based channels
+    │   ├── cdp.ts                # Chrome DevTools Protocol client (WebSocket)
+    │   ├── obsidian.ts           # Obsidian Local REST API
+    │   ├── vscode.ts             # VS Code settings/extensions via filesystem
+    │   ├── docker.ts             # Docker API via Unix domain socket
+    │   ├── defaults.ts           # macOS `defaults` command wrappers
+    │   └── raycast.ts            # Raycast deeplink helpers
     ├── recipes/
     │   ├── types.ts              # Recipe<TInput, TOutput> interface
     │   ├── mod.ts                # Recipe registry
     │   ├── spotify.ts            # Spotify recipes (play, nowPlaying, next, volume)
-    │   └── browser.ts            # Browser recipes (navigate, currentUrl)
+    │   └── browser.ts            # Browser recipes (navigate, currentUrl — multi-plane)
+    ├── runtime/
+    │   └── sandbox.ts            # Deno Worker sandbox for third-party recipes
     ├── cli/
     │   ├── main.ts               # CLI entry point (Deno.args → recipe dispatch)
     │   └── adapter.ts            # Recipe → CLI subcommand adapter
