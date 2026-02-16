@@ -1,14 +1,46 @@
-# Building a TypeScript + Rust Mac Automation Bridge (Deno + FFI)
+# Casper FFI Bridge: TypeScript ↔ Rust via Deno
 
-> **Note:** This document explores the flat, stateless FFI foundation. It has
-> been superseded by Casper's entity model (see `casper-tech-design.md`) which
-> adds handle-based state, typed entities, and snapshots on top of the same
-> Deno + Rust FFI layer described here.
+> **Foundation layer.** This document covers the FFI plumbing that Casper's
+> entity model (see `casper-tech-design.md`) is built on — how TypeScript
+> running in Deno calls into a Rust `cdylib` that wraps macOS frameworks.
+> Read this first to understand the boundary; read the tech design for the
+> higher-level `App` / `Window` / `Element` API that sits on top.
 
-Design document for building your own Mac automation bridge with TypeScript
-(Deno) as the agent orchestrator and Rust as the native layer calling macOS
-APIs directly. Connected via `Deno.dlopen` FFI — no napi-rs, no Node.js, no
-socket protocol.
+This document walks through building a Mac automation bridge where:
+
+- **TypeScript (Deno)** is the agent orchestrator — it runs the LLM loop,
+  decides what to do, and calls into native code for every macOS interaction.
+- **Rust** is the native layer — a compiled `cdylib` that links against macOS
+  frameworks (Accessibility, CoreGraphics, AppKit) and exposes a C ABI.
+- **Deno.dlopen** is the glue — Deno's built-in FFI mechanism loads the Rust
+  `.dylib` at runtime and maps its C functions directly into TypeScript.
+
+## What is FFI?
+
+**Foreign Function Interface (FFI)** lets one language call functions written
+in another. The key constraint: both sides must agree on a calling convention,
+and the C ABI is the universal one. Any language that can produce or consume
+C-compatible functions can participate.
+
+In Casper's stack this looks like:
+
+```
+TypeScript  ──Deno.dlopen──▶  C ABI  ◀──extern "C"──  Rust
+  (agent)                   (contract)              (native)
+```
+
+- **Rust** compiles to a `.dylib` (dynamic library) with `extern "C"` entry
+  points. The `#[no_mangle]` attribute preserves function names so the
+  dynamic linker can find them.
+- **Deno** calls `Deno.dlopen(path, symbolDefs)` to load that `.dylib` and
+  bind each C symbol to a callable TypeScript function.
+- **No serialization for primitives** — `f64`, `i32`, `bool` etc. map directly
+  between JS and C. For complex data (strings, JSON, byte arrays), Rust
+  allocates a buffer and returns a pointer that Deno reads and then frees.
+
+This is a **single-process** model: the Deno runtime and the Rust `.dylib`
+share an address space. macOS TCC permissions (Accessibility, Screen Recording)
+granted to the Deno process apply to the Rust code automatically.
 
 ## Architecture
 
@@ -58,18 +90,21 @@ socket protocol.
 
 ### Why Deno + Deno.dlopen
 
-- **No napi-rs** — `Deno.dlopen` loads any `.dylib` that exports C functions.
-  The Rust side just needs `extern "C"` + `#[no_mangle]`. No build tooling,
-  no codegen, no `@napi-rs/cli`.
-- **No Node.js** — Deno has built-in TypeScript, top-level await, permissions
-  model, and `Deno.dlopen` in the standard runtime. No `package.json`, no
-  `node_modules`.
+- **Built-in FFI** — `Deno.dlopen` is part of the standard runtime. Point it
+  at any `.dylib` that exports C functions and get callable TypeScript
+  symbols immediately.
+- **Built-in TypeScript** — Deno runs `.ts` files directly with top-level
+  await, a permissions model, and a standard library. The agent loop is
+  plain TypeScript with zero build step.
+- **Minimal Rust surface** — the Rust side only needs `extern "C"` +
+  `#[no_mangle]` and `cargo build`. No codegen, no binding macros, no
+  extra crates for the FFI layer itself.
 - **Single process** — the Deno runtime and the Rust `.dylib` share an address
   space. TCC grants (Accessibility, Screen Recording) apply to the single
   Deno process.
 - **Zero serialization for primitives** — `Deno.dlopen` maps C types directly
-  to JS: `f64`, `i32`, `u32`, `bool`, `pointer`, `buffer`. No JSON
-  encode/decode for simple calls like `click(x, y)`.
+  to JS: `f64`, `i32`, `u32`, `bool`, `pointer`, `buffer`. A call like
+  `click(500, 300)` is a direct C function invocation with no encoding.
 
 ### How Deno FFI Works
 
@@ -581,9 +616,9 @@ pub extern "C" fn mac_perform_action_at(
 
 ## Part 3: Rust Core Modules
 
-The core modules (input.rs, ax.rs, capture.rs, apps.rs, clipboard.rs,
-permissions.rs) are **unchanged from the previous document**. They use the
-same macOS APIs:
+Each core module wraps a specific set of macOS APIs. They are pure Rust —
+they know nothing about Deno or FFI. The `ffi.rs` layer above is the only
+file that uses `extern "C"`.
 
 - **input.rs** — `CGEventCreateMouseEvent`, `CGEventCreateKeyboardEvent`,
   `CGEventCreateScrollWheelEvent`, `CGEventPost` via the `core-graphics` crate
@@ -595,11 +630,8 @@ same macOS APIs:
 - **clipboard.rs** — `NSPasteboard` via `objc2-app-kit`
 - **permissions.rs** — `CGPreflightScreenCaptureAccess`, `AXIsProcessTrusted`
 
-The only difference is that the napi binding layer is gone. Instead, `ffi.rs`
-provides the `extern "C"` surface that `Deno.dlopen` calls.
-
-See the appendix at the end of this document for the full source of each
-core module, which is identical to the previous revision.
+This separation keeps the native logic testable in Rust independently of the
+TypeScript consumer.
 
 ---
 
@@ -1193,24 +1225,27 @@ TS: captureScreen()
 
 ---
 
-## Comparison: Deno FFI vs. Previous napi-rs Approach
+## FFI Trade-offs and Design Choices
 
-| Aspect | napi-rs (Node.js) | Deno.dlopen (Deno) |
-|---|---|---|
-| **Runtime** | Node.js | Deno |
-| **Binding layer** | napi-rs crate + `@napi-rs/cli` | `extern "C"` + `#[no_mangle]` only |
-| **Build artifact** | `.node` addon file | `.dylib` shared library |
-| **Type generation** | Auto-generated by napi-rs | Manual symbol definitions in TS |
-| **String passing** | napi handles automatically | Manual encode → buffer + length |
-| **Complex returns** | napi handles serde objects | Manual JSON via pointer + free |
-| **Build tooling** | Needs `@napi-rs/cli`, `npm` | Just `cargo build` |
-| **Dependencies** | `napi`, `napi-derive` crates | Zero extra Rust dependencies |
-| **Runtime overhead** | napi V8 bridge layer | Direct C function call |
+**What you get** from the Deno + Rust FFI approach:
 
-**Trade-off**: napi-rs gives you automatic type marshalling but ties you to
-Node.js and adds build complexity. Deno FFI is simpler on the Rust side
-(plain C exports) but requires manual pointer management on the TypeScript
-side. The `ffi_helpers.ts` module encapsulates that complexity.
+- A single `cargo build --release` produces the `.dylib`. The TypeScript side
+  loads it with one `Deno.dlopen` call. The build chain is two tools: `cargo`
+  and `deno`.
+- Primitive calls (click, scroll, hotkey) have zero serialization overhead —
+  they're direct C function invocations from the JS runtime.
+- The Rust core modules are plain library code with no framework-specific
+  binding macros. They can be tested independently with `cargo test`.
+
+**What you manage manually**:
+
+- String and buffer passing — TypeScript must encode strings to `Uint8Array`
+  and pass a length alongside. The `ffi_helpers.ts` module encapsulates this.
+- Complex returns — Rust allocates a buffer (JSON or PNG bytes), returns a
+  pointer + length, and TypeScript must call `mac_free_buffer` after reading.
+  Again, `callJson` and `callBytes` in `ffi_helpers.ts` handle the pattern.
+- Symbol definitions — each C function must be declared in both `ffi.rs`
+  (Rust) and `mod.ts` (TypeScript). These must stay in sync manually.
 
 ---
 
@@ -1241,11 +1276,10 @@ side. The `ffi_helpers.ts` module encapsulates that complexity.
 ## Appendix: Core Module Source
 
 The implementations of `input.rs`, `ax.rs`, `capture.rs`, `apps.rs`,
-`clipboard.rs`, and `permissions.rs` are identical to the previous document
-revision. They contain the actual macOS API calls (CGEvent, AXUIElement,
-CGWindowList, NSWorkspace, NSPasteboard, etc.) and are independent of the
-FFI binding mechanism. The only difference is that napi-rs wrappers are
-replaced by the `extern "C"` functions in `ffi.rs` above.
+`clipboard.rs`, and `permissions.rs` contain the actual macOS API calls
+(CGEvent, AXUIElement, CGWindowList, NSWorkspace, NSPasteboard, etc.).
+They are pure Rust modules with no FFI awareness — the `extern "C"`
+boundary in `ffi.rs` is the only file that bridges them to Deno.
 
-See `docs/casper/casper-ffi-bridge.md` for the full source of each core
-module.
+These modules will be detailed in a future revision of this document as
+the Casper implementation progresses.
