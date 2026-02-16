@@ -107,6 +107,12 @@ Casper
 │   ├── .execPipe(commands) → { stdout, stderr, code }
 │   └── .which(name) → string | null
 │
+├── Http                                 (stateless — escape hatch for HTTP APIs)
+│   ├── .connect(baseUrl, opts?) → HttpClient
+│   ├── .json(url, opts?) → any
+│   ├── .text(url, opts?) → string
+│   └── .ok(url) → boolean
+│
 └── Permissions
     ├── .check() → PermissionsStatus
     ├── .accessibility → boolean
@@ -120,7 +126,8 @@ Shell, AX, or fetch — but callers never see raw strings.
 
 Entities that hold state (App, Window, Element) have handles backed by live
 Rust-side objects. Stateless entities (Keyboard, Mouse, Screen, Clipboard,
-Script, Shell) are global singletons that call macOS APIs directly.
+Script, Shell, Http) are global singletons that call macOS or system APIs
+directly.
 
 ---
 
@@ -779,6 +786,7 @@ export { Mouse } from "./entities/mouse.ts";
 export { Screen } from "./entities/screen.ts";
 export { Clipboard } from "./entities/clipboard.ts";
 export { Shell } from "./entities/shell.ts";
+export { Http } from "./entities/http.ts";
 export { Browser } from "./entities/browser.ts";
 export { Mail } from "./entities/mail.ts";
 export { MusicPlayer } from "./entities/music-player.ts";
@@ -1056,8 +1064,9 @@ class SomeApp extends App {
   async doThing(param: string): Promise<Result> {
     // 3. Implementation picks the best tool:
     //    - Script.tell() for scriptable apps
+    //    - Shell.exec() for CLI-driven tools
+    //    - Http.json() for apps with local APIs
     //    - AX (this.focusedWindow().find(...)) for UI
-    //    - fetch() for apps with local APIs
     //    - Keyboard.hotkey() for shortcuts
   }
 }
@@ -1150,18 +1159,20 @@ await snap.click(5);     // LLM said "click ref 5"
 
 ---
 
-## Escape Hatches: Script & Shell
+## Escape Hatches: Script, Shell & Http
 
-Casper has four ways to talk to apps. Two are typed (entities, AX queries).
-Two are escape hatches for when typed coverage doesn't exist yet:
+Typed entities are the primary API. But Casper can't ship a typed entity for
+every app on day one. Three escape hatches cover the long tail — each wraps
+a different transport:
 
-| | What it does | Transport |
-|---|---|---|
-| **Script** | AppleScript verbs (`play track`, `set URL`) | NSAppleScript via Rust FFI |
-| **Shell** | CLI commands (`git commit`, `brew install`) | Deno.Command subprocess |
+| | What it does | Transport | Needs Rust FFI? |
+|---|---|---|---|
+| **Script** | AppleScript verbs (`play track`, `set URL`) | NSAppleScript | Yes |
+| **Shell** | CLI commands (`git commit`, `brew install`) | Deno.Command | No |
+| **Http** | HTTP APIs (`PUT /vault/note`, `GET /api/v1`) | fetch() | No |
 
-Both are like `eval()` in JavaScript: powerful, untyped, no autocomplete.
-The typed entity is always preferred. These exist for the long tail.
+All three are like `eval()` in JavaScript: powerful, untyped, no autocomplete.
+The typed entity is always preferred. These exist for apps without one.
 
 ### Script
 
@@ -1206,8 +1217,72 @@ export const Shell = {
 };
 ```
 
-Shell doesn't need Rust FFI — Deno has `Deno.Command` built in. The entity
-just provides a consistent API shape and result type.
+### Http
+
+```typescript
+interface HttpClient {
+  json<T = unknown>(path: string, opts?: RequestInit): Promise<T>;
+  text(path: string, opts?: RequestInit): Promise<string>;
+  ok(path?: string): Promise<boolean>;
+}
+
+export const Http = {
+  /** Create a client bound to a base URL (reusable for entity impls). */
+  connect(baseUrl: string, opts?: { headers?: Record<string, string> }): HttpClient {
+    const defaults = opts?.headers ?? {};
+    return {
+      async json<T>(path: string, init?: RequestInit): Promise<T> {
+        const res = await fetch(`${baseUrl}${path}`, {
+          ...init,
+          headers: { "Content-Type": "application/json", ...defaults, ...init?.headers },
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+        return res.json();
+      },
+      async text(path: string, init?: RequestInit): Promise<string> {
+        const res = await fetch(`${baseUrl}${path}`, {
+          ...init,
+          headers: { ...defaults, ...init?.headers },
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+        return res.text();
+      },
+      async ok(path = "/"): Promise<boolean> {
+        try { const res = await fetch(`${baseUrl}${path}`); return res.ok; }
+        catch { return false; }
+      },
+    };
+  },
+
+  /** One-shot JSON fetch (no base URL). */
+  async json<T = unknown>(url: string, opts?: RequestInit): Promise<T> {
+    const res = await fetch(url, {
+      ...opts,
+      headers: { "Content-Type": "application/json", ...opts?.headers },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+    return res.json();
+  },
+
+  /** One-shot text fetch. */
+  async text(url: string, opts?: RequestInit): Promise<string> {
+    const res = await fetch(url, opts);
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+    return res.text();
+  },
+
+  /** Is this URL reachable? */
+  async ok(url: string): Promise<boolean> {
+    try { const res = await fetch(url); return res.ok; }
+    catch { return false; }
+  },
+};
+```
+
+`Http.connect()` returns a reusable client — entity implementations store
+it and call `this.api.json("/endpoint")` instead of raw `fetch()` with
+repeated base URLs and headers. The one-shot methods (`Http.json()`,
+`Http.text()`) cover quick ad-hoc use.
 
 ### When to use what (for callers)
 
@@ -1220,8 +1295,8 @@ Has a typed entity? (Browser, Mail, MusicPlayer)
 No typed entity?
   → Script.tell() for scriptable apps          ← fast, semantic verbs
   → Shell.exec() for CLI-driven tools          ← git, docker, brew, ffmpeg
+  → Http.json() for apps with HTTP APIs        ← Obsidian, Home Assistant, Linear
   → AX: find → click → type                   ← always works for GUI apps
-  → fetch() for HTTP APIs                      ← Obsidian, local servers
 ```
 
 ### When to use what (for entity implementations)
@@ -1239,9 +1314,16 @@ async commit(message: string) {
   return await Shell.exec("git", ["commit", "-m", message]);
 }
 
-// A hypothetical Obsidian entity uses fetch — it has a local REST API
+// A hypothetical Obsidian entity uses Http — it has a local REST API
+private api = Http.connect("http://localhost:27123", {
+  headers: { "Authorization": `Bearer ${this.token}` },
+});
+
 async createNote(title: string, content: string) {
-  await fetch("http://localhost:27123/vault/" + title, { method: "PUT", body: content });
+  await this.api.json(`/vault/${encodeURIComponent(title)}`, {
+    method: "PUT",
+    body: JSON.stringify({ content }),
+  });
 }
 ```
 
@@ -1405,6 +1487,7 @@ casper/
     │   ├── clipboard.ts
     │   ├── script.ts             # escape hatch — AppleScript
     │   ├── shell.ts              # escape hatch — CLI subprocess
+    │   ├── http.ts               # escape hatch — HTTP APIs
     │   └── snapshot.ts
     └── test/
         ├── browser_test.ts
