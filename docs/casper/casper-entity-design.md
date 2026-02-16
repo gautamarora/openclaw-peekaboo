@@ -37,6 +37,27 @@ Casper
 │   ├── .focusedWindow() → Window
 │   └── .menu(path), .menus()
 │
+│   ├── Browser extends App
+│   │   ├── .open(name?) → Browser       (static — defaults to default browser)
+│   │   ├── .navigate(url), .url() → string
+│   │   ├── .tabs() → Tab[], .activeTab() → Tab
+│   │   ├── .newTab(url?), .closeTab(index?)
+│   │   └── .search(query)
+│   │
+│   ├── Mail extends App
+│   │   ├── .open() → Mail               (static — opens default mail client)
+│   │   ├── .inbox(opts?) → Message[]
+│   │   ├── .compose(to, subject, body) → void
+│   │   ├── .reply(message, body) → void
+│   │   └── .accounts() → string[]
+│   │
+│   └── MusicPlayer extends App
+│       ├── .open(name?) → MusicPlayer   (static)
+│       ├── .nowPlaying() → Track
+│       ├── .play(uri?), .pause(), .next(), .previous()
+│       ├── .search(query) → void
+│       └── .volume(level?) → number
+│
 ├── Window
 │   ├── .focus(), .close(), .minimize(), .maximize()
 │   ├── .move(point), .resize(size), .bounds()
@@ -76,7 +97,7 @@ Casper
 │   ├── .read(), .write(text), .clear()
 │   └── .readImage() → Uint8Array | null
 │
-├── Script                               (stateless — runs AppleScript)
+├── Script                               (stateless — escape hatch for AppleScript)
 │   ├── .tell(app, command) → string
 │   ├── .eval(source) → Record
 │   └── .canScript(app) → boolean
@@ -86,6 +107,11 @@ Casper
     ├── .accessibility → boolean
     └── .screenRecording → boolean
 ```
+
+App-specific entities (Browser, Mail, MusicPlayer) inherit all of App's
+handle-based powers (windows, focus, activate, snapshot) and add typed
+methods for domain actions. Internally they use Script.tell() or AX — but
+callers never see raw AppleScript strings.
 
 Entities that hold state (App, Window, Element) have handles backed by live
 Rust-side objects. Stateless entities (Keyboard, Mouse, Screen, Clipboard,
@@ -747,11 +773,292 @@ export { Keyboard } from "./entities/keyboard.ts";
 export { Mouse } from "./entities/mouse.ts";
 export { Screen } from "./entities/screen.ts";
 export { Clipboard } from "./entities/clipboard.ts";
+export { Browser } from "./entities/browser.ts";
+export { Mail } from "./entities/mail.ts";
+export { MusicPlayer } from "./entities/music-player.ts";
 export type { Point, Rect, Size } from "./types.ts";
 
 import lib from "./ffi/symbols.ts";
 export function shutdown(): void { lib.symbols.casper_release_all(); lib.close(); }
 ```
+
+---
+
+## App-Specific Entities
+
+App subclasses wrap Script/AX internals in typed methods. The pattern:
+
+1. Extend `App` — inherit handle, windows, focus, snapshot
+2. Add domain methods — typed, async, no AppleScript visible to callers
+3. Keep app knowledge private — bundle IDs, verbs, queries are implementation details
+
+`Script.tell()` is like `eval()` in JavaScript: powerful but untyped. App
+entities are the typed wrapper — callers get autocomplete, type checking, and
+no raw AppleScript strings.
+
+### Browser
+
+```typescript
+// casper/entities/browser.ts
+import { App } from "./app.ts";
+
+interface Tab {
+  title: string;
+  url: string;
+  index: number;
+}
+
+export class Browser extends App {
+  /** Open a browser by name, or the system default. */
+  static async open(name?: string): Promise<Browser> {
+    const bundleId = name
+      ? (await App.find(name)).bundleId
+      : "com.apple.Safari";  // TODO: read LSHandlers for default
+    const app = await App.launch(bundleId);
+    return new Browser(app);
+  }
+
+  /** Navigate the active tab to a URL. */
+  async navigate(url: string): Promise<void> {
+    await Script.tell(this.name, `set URL of front document to "${url}"`);
+  }
+
+  /** Get the URL of the active tab. */
+  async url(): Promise<string> {
+    return (await Script.tell(this.name, "return URL of front document")) ?? "";
+  }
+
+  /** List all tabs. */
+  async tabs(): Promise<Tab[]> {
+    const raw = await Script.eval(`
+      tell application "${this.name}"
+        set output to {}
+        repeat with t in tabs of front window
+          set end of output to {name of t, URL of t}
+        end repeat
+        return output
+      end tell
+    `);
+    // parse into Tab[]
+    return this.parseTabs(raw);
+  }
+
+  /** Open a new tab, optionally navigating to a URL. */
+  async newTab(url?: string): Promise<void> {
+    if (url) {
+      await Script.tell(this.name, `make new document with properties {URL:"${url}"}`);
+    } else {
+      await Keyboard.hotkey("cmd+t");
+    }
+  }
+
+  async activeTab(): Promise<Tab> {
+    const result = await Script.eval(`
+      tell application "${this.name}"
+        return {name of front document, URL of front document}
+      end tell
+    `);
+    return this.parseTab(result, 0);
+  }
+
+  async search(query: string): Promise<void> {
+    await this.activate();
+    await Keyboard.hotkey("cmd+l");
+    await Keyboard.type(query);
+    await Keyboard.press("return");
+  }
+
+  // -- private helpers for parsing Script output --
+  private parseTabs(raw: unknown): Tab[] { /* ... */ }
+  private parseTab(raw: unknown, index: number): Tab { /* ... */ }
+}
+```
+
+### Mail
+
+```typescript
+// casper/entities/mail.ts
+import { App } from "./app.ts";
+
+interface Message {
+  id: string;
+  subject: string;
+  sender: string;
+  date: Date;
+  isRead: boolean;
+  snippet: string;
+}
+
+export class Mail extends App {
+  /** Open the default mail client. */
+  static async open(): Promise<Mail> {
+    const app = await App.launch("com.apple.mail");
+    return new Mail(app);
+  }
+
+  /** Fetch inbox messages, optionally filtered. */
+  async inbox(opts?: { unread?: boolean; limit?: number }): Promise<Message[]> {
+    const limit = opts?.limit ?? 20;
+    const filter = opts?.unread ? "whose read status is false" : "";
+    const raw = await Script.eval(`
+      tell application "Mail"
+        set msgs to (messages of inbox ${filter})
+        set output to {}
+        repeat with i from 1 to (minimum of {${limit}, count of msgs})
+          set m to item i of msgs
+          set end of output to {id of m, subject of m, sender of m, ¬
+            date sent of m, read status of m}
+        end repeat
+        return output
+      end tell
+    `);
+    return this.parseMessages(raw);
+  }
+
+  /** Compose and send a new email. */
+  async compose(to: string, subject: string, body: string): Promise<void> {
+    await Script.eval(`
+      tell application "Mail"
+        set newMsg to make new outgoing message with properties ¬
+          {subject:"${subject}", content:"${body}", visible:true}
+        tell newMsg
+          make new to recipient at end of to recipients ¬
+            with properties {address:"${to}"}
+        end tell
+        send newMsg
+      end tell
+    `);
+  }
+
+  /** Reply to a message. */
+  async reply(message: Message, body: string): Promise<void> {
+    await Script.eval(`
+      tell application "Mail"
+        set m to first message of inbox whose id is "${message.id}"
+        set r to reply m with opening window
+        set content of r to "${body}"
+        send r
+      end tell
+    `);
+  }
+
+  /** List mail accounts. */
+  async accounts(): Promise<string[]> {
+    const raw = await Script.tell("Mail", "return name of every account");
+    return (raw ?? "").split(", ");
+  }
+
+  private parseMessages(raw: unknown): Message[] { /* ... */ }
+}
+```
+
+### MusicPlayer
+
+```typescript
+// casper/entities/music-player.ts
+import { App } from "./app.ts";
+
+interface Track {
+  name: string;
+  artist: string;
+  album: string;
+  duration: number;
+  playing: boolean;
+}
+
+const KNOWN_PLAYERS: Record<string, string> = {
+  "Spotify": "com.spotify.client",
+  "Music": "com.apple.Music",
+};
+
+export class MusicPlayer extends App {
+  /** Open a music player by name (defaults to Spotify). */
+  static async open(name = "Spotify"): Promise<MusicPlayer> {
+    const bundleId = KNOWN_PLAYERS[name] ?? (await App.find(name)).bundleId;
+    const app = await App.launch(bundleId);
+    return new MusicPlayer(app);
+  }
+
+  /** What's currently playing? */
+  async nowPlaying(): Promise<Track> {
+    const raw = await Script.eval(`
+      tell application "${this.name}"
+        return {name of current track, artist of current track, ¬
+                album of current track, duration of current track, player state}
+      end tell
+    `);
+    return this.parseTrack(raw);
+  }
+
+  /** Play a track (by URI or just resume). */
+  async play(uri?: string): Promise<void> {
+    if (uri) {
+      await Script.tell(this.name, `play track "${uri}"`);
+    } else {
+      await Script.tell(this.name, "play");
+    }
+  }
+
+  async pause(): Promise<void> {
+    await Script.tell(this.name, "pause");
+  }
+
+  async next(): Promise<void> {
+    await Script.tell(this.name, "next track");
+  }
+
+  async previous(): Promise<void> {
+    await Script.tell(this.name, "previous track");
+  }
+
+  /** Open search and type a query. Falls back to AX + keyboard. */
+  async search(query: string): Promise<void> {
+    await this.activate();
+    await Keyboard.hotkey("cmd+k");
+    const win = await this.focusedWindow();
+    const field = await win.waitFor({ role: "AXTextField" }, 3000);
+    await field.type(query);
+    await Keyboard.press("return");
+  }
+
+  /** Get or set volume (0-100). */
+  async volume(level?: number): Promise<number> {
+    if (level !== undefined) {
+      await Script.tell(this.name, `set sound volume to ${level}`);
+      return level;
+    }
+    const raw = await Script.tell(this.name, "return sound volume");
+    return parseInt(raw ?? "0", 10);
+  }
+
+  private parseTrack(raw: unknown): Track { /* ... */ }
+}
+```
+
+### The pattern
+
+Every app-specific entity follows the same shape:
+
+```typescript
+class SomeApp extends App {
+  // 1. Static factory — knows the bundle ID
+  static async open(): Promise<SomeApp> {
+    return new SomeApp(await App.launch("com.example.app"));
+  }
+
+  // 2. Domain methods — typed params, typed returns
+  async doThing(param: string): Promise<Result> {
+    // 3. Implementation picks the best tool:
+    //    - Script.tell() for scriptable apps
+    //    - AX (this.focusedWindow().find(...)) for UI
+    //    - fetch() for apps with local APIs
+    //    - Keyboard.hotkey() for shortcuts
+  }
+}
+```
+
+Callers never see AppleScript. If an app is non-scriptable, the subclass
+uses AX internally — the typed API stays the same.
 
 ---
 
@@ -837,7 +1144,7 @@ await snap.click(5);     // LLM said "click ref 5"
 
 ---
 
-## AppleScript
+## AppleScript & Script
 
 AX and AppleScript are complementary:
 
@@ -848,7 +1155,11 @@ AX and AppleScript are complementary:
 | **Speed** | Must walk element tree | Direct command dispatch |
 | **Best for** | Clicking elements, reading layout | App-specific actions, state queries |
 
-### The Script entity
+### The Script entity — an escape hatch
+
+`Script` is to Casper what `eval()` is to JavaScript: powerful, but untyped.
+App-specific entity subclasses exist so that callers don't need Script directly.
+Use Script as a last resort for one-off automation of apps without a typed entity.
 
 ```typescript
 export const Script = {
@@ -864,114 +1175,105 @@ export const Script = {
 };
 ```
 
-### Use the best tool for each action
+### When to use what
 
 ```
-Scriptable app (Spotify, Safari, Mail)?
-  → Use Script.tell() for semantic actions    ← fast, reliable
-  → Use AX only when you need UI structure    ← clicking custom elements, reading layout
+Has a typed entity? (Browser, Mail, MusicPlayer)
+  → Use the entity                             ← typed, autocomplete, no raw strings
+  → browser.navigate(url)                      ← NOT Script.tell("Safari", "...")
+
+Unknown scriptable app?
+  → Script.tell() as escape hatch              ← still better than AX for verbs
 
 Non-scriptable app (Electron, random GUI)?
-  → AX only: find → click → type             ← always works
+  → AX: find → click → type                   ← always works
 
-App with an API (Gmail, Obsidian)?
-  → Just use fetch()                          ← it's TypeScript, no abstraction needed
+App with an HTTP API (Gmail, Obsidian)?
+  → Just use fetch()                           ← it's TypeScript
 ```
 
-No formal "planes" — just use the right tool. Script for scriptable apps.
-AX handles for UI. `fetch` for APIs. They're all available, pick what works.
-
----
-
-## App Knowledge
-
-For well-known apps, we bundle what we know so agents can skip exploratory
-AX tree walking. Just plain objects:
-
-```typescript
-// casper/apps/spotify.ts
-export const spotify = {
-  bundleId: "com.spotify.client",
-  name: "Spotify",
-  scriptable: true,
-
-  verbs: {
-    play: (uri?: string) => uri ? `play track "${uri}"` : "play",
-    pause: "pause",
-    next: "next track",
-    volume: (n: number) => `set sound volume to ${n}`,
-  },
-
-  shortcuts: { search: "cmd+k", preferences: "cmd+," },
-
-  queries: {
-    nowPlaying: `
-      set a to artist of current track
-      set t to name of current track
-      return {artist:a, track:t}
-    `,
-  },
-};
-```
-
-An agent uses this directly — no framework, no registry:
-
-```typescript
-import { spotify } from "./apps/spotify.ts";
-import { Script, App, Keyboard } from "./mod.ts";
-
-async function playTrack(uri: string) {
-  if (spotify.scriptable) {
-    await Script.tell("Spotify", spotify.verbs.play(uri), { launchIfNeeded: true });
-  } else {
-    const app = await App.launch(spotify.bundleId);
-    await app.activate();
-    const win = await app.focusedWindow();
-    await Keyboard.hotkey(spotify.shortcuts.search);
-    const search = await win.waitFor({ role: "AXTextField" }, 3000);
-    await search.type(uri);
-    await Keyboard.press("return");
-  }
-}
-```
+The entity is always preferred over Script. Script is always preferred over
+raw AX tree walking for verb-like actions. AX is for UI structure.
 
 ---
 
 ## Usage Examples
 
-### Agent loop
+### 1. Open Hacker News in Safari
 
 ```typescript
-import { App, Screen, Keyboard, shutdown } from "./casper/mod.ts";
+import { Browser } from "./casper/mod.ts";
 
-const apps = await App.all();
-let safari = await App.find("Safari");
-await safari.activate();
+const safari = await Browser.open("Safari");
+await safari.navigate("https://news.ycombinator.com");
 
+// Want to interact with the page? Use AX through the entity:
 const win = await safari.focusedWindow();
-const png = await win.capture();
-await Deno.writeFile("/tmp/safari.png", png);
-
-const urlBar = await win.find({ role: "AXTextField", identifier: "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD" });
-if (urlBar) {
-  await urlBar.click();
-  await Keyboard.hotkey("cmd+a");
-  await Keyboard.type("https://example.com");
-  await Keyboard.press("return");
-}
-
-await new Promise(r => setTimeout(r, 2000));
 const links = await win.findAll({ role: "AXLink" });
-if (links[0]) await links[0].click();
-
-apps.forEach(a => a.dispose());
-shutdown();
+const topStory = links[0];
+if (topStory) await topStory.click();
 ```
 
-### Snapshot-driven agent
+No `Script.tell("Safari", ...)`. `Browser.navigate()` handles it internally.
+
+### 2. Play top song on Spotify
 
 ```typescript
-import { App, Script } from "./casper/mod.ts";
+import { MusicPlayer } from "./casper/mod.ts";
+
+const spotify = await MusicPlayer.open("Spotify");
+await spotify.search("top hits 2026");
+
+// Check what's playing
+const track = await spotify.nowPlaying();
+console.log(`Now playing: ${track.name} by ${track.artist}`);
+
+// Control playback
+await spotify.next();
+await spotify.volume(80);
+```
+
+No `Script.eval("tell application \"Spotify\" ...")`. `MusicPlayer` wraps the
+AppleScript verbs (play, pause, next track) and keyboard shortcuts (cmd+k for
+search) internally. Callers get typed methods.
+
+### 3. Read and respond to email
+
+```typescript
+import { Mail } from "./casper/mod.ts";
+
+const mail = await Mail.open();
+
+// Get unread messages — typed return, not raw AppleScript
+const unread = await mail.inbox({ unread: true, limit: 10 });
+
+for (const msg of unread) {
+  console.log(`From: ${msg.sender} — ${msg.subject}`);
+
+  // Decide which need a response (could be LLM-driven)
+  if (msg.subject.includes("urgent")) {
+    await mail.reply(msg, `Thanks for flagging this. I'll look into it.`);
+  }
+}
+
+// Compose a new message
+await mail.compose(
+  "team@example.com",
+  "Weekly update",
+  "Here's the summary for this week..."
+);
+```
+
+No 30-line `Script.eval()` with raw AppleScript. `Mail.inbox()` returns
+typed `Message[]`. `Mail.reply()` takes a `Message` and a `string`.
+The AppleScript is an implementation detail inside the entity.
+
+### 4. Snapshot-driven agent (generic approach)
+
+For apps without a typed entity, snapshots + AX still work:
+
+```typescript
+import { App } from "./casper/mod.ts";
 
 const app = await App.frontmost();
 const win = await app.focusedWindow();
@@ -979,14 +1281,9 @@ const win = await app.focusedWindow();
 using snap = await win.snapshot();
 console.log(snap.text);  // send to LLM
 await snap.click(3);     // LLM picks a ref
-
-// Combine with AppleScript when it helps
-const state = await Script.eval(`
-  tell application "Spotify"
-    return {track:name of current track, artist:artist of current track}
-  end tell
-`);
 ```
+
+This is the fallback for unknown apps. For well-known apps, use the typed entity.
 
 ---
 
@@ -1044,17 +1341,24 @@ casper/
     │   ├── handles.ts            # Handle base class
     │   └── helpers.ts            # pointer/buffer utils
     ├── entities/
-    │   ├── app.ts
+    │   ├── app.ts                # base App (handle-based)
+    │   ├── browser.ts            # Browser extends App
+    │   ├── mail.ts               # Mail extends App
+    │   ├── music-player.ts       # MusicPlayer extends App
     │   ├── window.ts
     │   ├── element.ts
     │   ├── keyboard.ts
     │   ├── mouse.ts
     │   ├── screen.ts
     │   ├── clipboard.ts
-    │   ├── script.ts
+    │   ├── script.ts             # escape hatch — raw AppleScript
     │   └── snapshot.ts
-    └── apps/                     # app knowledge (plain objects)
-        ├── spotify.ts
-        ├── safari.ts
-        └── mail.ts
+    └── test/
+        ├── browser_test.ts
+        ├── mail_test.ts
+        └── music_test.ts
 ```
+
+The `apps/` directory from earlier drafts is gone. App knowledge (bundle IDs,
+AppleScript verbs, keyboard shortcuts) lives inside the entity subclasses as
+private implementation details, not as exported plain objects.
