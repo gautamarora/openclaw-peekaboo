@@ -2550,6 +2550,679 @@ know which MCP server to call.
 
 ---
 
+## Recipes: Skills and CLIs on Top of Entities
+
+Casper's entity model is the foundation — typed, handle-based, composable at
+the language level. But real-world adoption needs three more surfaces:
+
+1. **CLI commands** — so shell scripts and subprocess-based agents (OpenClaw,
+   Claude Code) can call Casper without writing TypeScript
+2. **MCP tools** — so LLM agents can invoke Casper operations via the Model
+   Context Protocol
+3. **Skills** — so LLMs have domain knowledge about *how* to combine operations
+   for specific apps
+
+The question is how to add these without losing type safety. The answer is
+**Recipes** — a middle layer between raw entities and external surfaces.
+
+### The three layers
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Layer 3: Surfaces (how the outside world calls Casper)         │
+│                                                                 │
+│  ┌──────────┐  ┌───────────┐  ┌─────────────┐  ┌───────────┐  │
+│  │  CLI      │  │  MCP Tool │  │  Skill Desc │  │  TS Import│  │
+│  │  casper   │  │  (JSON    │  │  (LLM-      │  │  (direct  │  │
+│  │  play     │  │   schema) │  │   readable  │  │   code)   │  │
+│  │  --uri .. │  │           │  │   markdown) │  │           │  │
+│  └─────┬─────┘  └─────┬─────┘  └──────┬──────┘  └─────┬─────┘  │
+│        │              │               │                │        │
+│  ──────▼──────────────▼───────────────▼────────────────▼─────── │
+│                                                                 │
+│  Layer 2: Recipes (typed functions composing entities)           │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │  spotify.play(uri)                                      │    │
+│  │  spotify.search(query) → Track[]                        │    │
+│  │  spotify.nowPlaying() → TrackInfo                       │    │
+│  │  browser.navigate(url)                                  │    │
+│  │  browser.clickInPage(query)                             │    │
+│  │  finder.copyFile(src, dest)                             │    │
+│  └─────────────────────────┬───────────────────────────────┘    │
+│                            │                                    │
+│  ──────────────────────────▼─────────────────────────────────── │
+│                                                                 │
+│  Layer 1: Entities (typed, handle-based, FFI-backed)            │
+│                                                                 │
+│  App  Window  Element  Script  Keyboard  Mouse  Screen  ...    │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### What is a Recipe?
+
+A Recipe is a **typed TypeScript function** that composes entities to
+accomplish a domain task. It's code, not documentation. It has:
+
+- Typed inputs and outputs (not loose JSON)
+- A decorator/metadata block that generates CLI args, MCP schemas, and skill
+  descriptions from the same source of truth
+- A body that uses entities directly
+
+```typescript
+// casper/recipes/types.ts
+
+/** Metadata that describes a recipe for external surfaces. */
+export interface RecipeMeta {
+  /** Machine-readable name (used as CLI subcommand and MCP tool name). */
+  name: string;
+
+  /** One-line description for --help and MCP tool listing. */
+  description: string;
+
+  /** Category for grouping in CLI help and skill descriptions. */
+  category: string;
+
+  /** The app profile this recipe targets (optional). */
+  app?: string;
+
+  /** Parameter definitions — single source of truth for CLI args, MCP schema, and JSDoc. */
+  params: Record<string, ParamDef>;
+}
+
+export interface ParamDef {
+  type: "string" | "number" | "boolean";
+  description: string;
+  required?: boolean;
+  default?: unknown;
+  enum?: string[];
+}
+
+/** A recipe is a function plus its metadata. */
+export interface Recipe<TInput, TOutput> {
+  meta: RecipeMeta;
+  execute: (input: TInput) => Promise<TOutput>;
+}
+```
+
+### Example: Spotify recipes
+
+```typescript
+// casper/recipes/spotify.ts
+import { App, Script, Keyboard } from "../entities/mod.ts";
+import { getProfile } from "../profiles/mod.ts";
+import type { Recipe } from "./types.ts";
+
+// --- Types ---
+
+interface PlayInput {
+  uri?: string;
+  query?: string;
+}
+
+interface TrackInfo {
+  artist: string;
+  track: string;
+  album: string;
+  duration: number;
+  position: number;
+  state: string;
+  url: string;
+}
+
+// --- Recipes ---
+
+export const play: Recipe<PlayInput, void> = {
+  meta: {
+    name: "spotify.play",
+    description: "Play a track on Spotify by URI or search query",
+    category: "media",
+    app: "com.spotify.client",
+    params: {
+      uri: { type: "string", description: "Spotify URI (e.g. spotify:track:xxx)" },
+      query: { type: "string", description: "Search query (uses keyboard shortcut)" },
+    },
+  },
+
+  async execute({ uri, query }) {
+    const profile = getProfile("com.spotify.client");
+
+    if (uri && profile?.scriptable) {
+      // Fast path: AppleScript
+      await Script.tell("Spotify", `play track "${uri}"`, { launchIfNeeded: true });
+      return;
+    }
+
+    // Fallback: UI automation
+    const spotify = await App.find("Spotify") ?? await App.launch("com.spotify.client");
+    await spotify.activate();
+    const win = await spotify.focusedWindow();
+
+    if (query) {
+      await Keyboard.hotkey(profile?.shortcuts?.search ?? "cmd+k");
+      const searchField = await win.waitFor({ role: "AXTextField" }, 3000);
+      await searchField.type(query);
+      await Keyboard.press("return");
+      // Wait for results, play top result
+      await new Promise(r => setTimeout(r, 1500));
+      await Keyboard.press("return");
+    } else if (uri) {
+      await Keyboard.hotkey(profile?.shortcuts?.search ?? "cmd+k");
+      const searchField = await win.waitFor({ role: "AXTextField" }, 3000);
+      await searchField.type(uri);
+      await Keyboard.press("return");
+    }
+  },
+};
+
+export const nowPlaying: Recipe<void, TrackInfo> = {
+  meta: {
+    name: "spotify.now-playing",
+    description: "Get the currently playing track on Spotify",
+    category: "media",
+    app: "com.spotify.client",
+    params: {},
+  },
+
+  async execute() {
+    const profile = getProfile("com.spotify.client");
+    if (!profile?.queries?.nowPlaying) {
+      throw new Error("Spotify profile missing nowPlaying query");
+    }
+
+    const result = await Script.eval(`
+      tell application "Spotify"
+        ${profile.queries.nowPlaying}
+      end tell
+    `);
+
+    return result as TrackInfo;
+  },
+};
+
+export const next: Recipe<void, void> = {
+  meta: {
+    name: "spotify.next",
+    description: "Skip to the next track on Spotify",
+    category: "media",
+    app: "com.spotify.client",
+    params: {},
+  },
+
+  async execute() {
+    await Script.tell("Spotify", "next track");
+  },
+};
+
+export const setVolume: Recipe<{ level: number }, void> = {
+  meta: {
+    name: "spotify.volume",
+    description: "Set Spotify playback volume (0-100)",
+    category: "media",
+    app: "com.spotify.client",
+    params: {
+      level: { type: "number", description: "Volume level 0-100", required: true },
+    },
+  },
+
+  async execute({ level }) {
+    const clamped = Math.max(0, Math.min(100, Math.round(level)));
+    await Script.tell("Spotify", `set sound volume to ${clamped}`);
+  },
+};
+```
+
+### Example: Browser recipes
+
+```typescript
+// casper/recipes/browser.ts
+import { App, Script, Keyboard } from "../entities/mod.ts";
+import { getProfile } from "../profiles/mod.ts";
+import type { Recipe } from "./types.ts";
+
+export const navigate: Recipe<{ url: string; app?: string }, void> = {
+  meta: {
+    name: "browser.navigate",
+    description: "Navigate the browser to a URL",
+    category: "browser",
+    params: {
+      url: { type: "string", description: "URL to navigate to", required: true },
+      app: { type: "string", description: "Browser app name (default: Safari)" },
+    },
+  },
+
+  async execute({ url, app = "Safari" }) {
+    const profile = getProfile(app);
+
+    if (profile?.scriptable && profile.verbs?.openUrl) {
+      const verb = typeof profile.verbs.openUrl === "function"
+        ? profile.verbs.openUrl(url)
+        : profile.verbs.openUrl;
+      await Script.tell(app, verb, { launchIfNeeded: true });
+    } else {
+      // Fallback: keyboard shortcut
+      const browser = await App.find(app) ?? await App.launch(app);
+      await browser.activate();
+      await Keyboard.hotkey("cmd+l");
+      await Keyboard.hotkey("cmd+a");
+      await Keyboard.type(url);
+      await Keyboard.press("return");
+    }
+  },
+};
+
+export const currentUrl: Recipe<{ app?: string }, string> = {
+  meta: {
+    name: "browser.current-url",
+    description: "Get the URL of the active browser tab",
+    category: "browser",
+    params: {
+      app: { type: "string", description: "Browser app name (default: Safari)" },
+    },
+  },
+
+  async execute({ app = "Safari" }) {
+    const result = await Script.tell(app, "return URL of current tab of front window");
+    return result ?? "";
+  },
+};
+```
+
+### How recipes become CLI commands
+
+A **CLI adapter** auto-generates Deno subcommands from recipe metadata:
+
+```typescript
+// casper/cli/adapter.ts
+import { parseArgs } from "jsr:@std/cli/parse-args";
+import { registry } from "../recipes/mod.ts";
+
+/**
+ * Auto-generate CLI from recipe registry.
+ *
+ * Usage:
+ *   casper spotify.play --uri "spotify:track:xxx"
+ *   casper spotify.now-playing
+ *   casper spotify.volume --level 75
+ *   casper browser.navigate --url "https://example.com"
+ */
+export async function runCLI(args: string[]): Promise<void> {
+  const recipeName = args[0];
+  const recipe = registry.get(recipeName);
+
+  if (!recipe) {
+    console.log("Available commands:");
+    for (const [name, r] of registry) {
+      console.log(`  casper ${name.padEnd(30)} ${r.meta.description}`);
+    }
+    Deno.exit(1);
+  }
+
+  // Parse args from recipe param definitions
+  const parsed = parseArgs(args.slice(1), {
+    string: Object.entries(recipe.meta.params)
+      .filter(([_, p]) => p.type === "string")
+      .map(([name]) => name),
+    boolean: Object.entries(recipe.meta.params)
+      .filter(([_, p]) => p.type === "boolean")
+      .map(([name]) => name),
+    default: Object.fromEntries(
+      Object.entries(recipe.meta.params)
+        .filter(([_, p]) => p.default !== undefined)
+        .map(([name, p]) => [name, p.default]),
+    ),
+  });
+
+  // Execute
+  const result = await recipe.execute(parsed);
+  if (result !== undefined) {
+    console.log(JSON.stringify(result, null, 2));
+  }
+}
+```
+
+```
+$ casper spotify.play --uri "spotify:track:4uLU6hMCjMI75M1A2tKUQC"
+$ casper spotify.now-playing
+{"artist":"Queen","track":"Bohemian Rhapsody","album":"A Night at the Opera",...}
+$ casper spotify.volume --level 50
+$ casper browser.navigate --url "https://x.com/elonmusk/status/123"
+```
+
+### How recipes become MCP tools
+
+An **MCP adapter** auto-generates JSON schema and tool handlers from the same
+recipe metadata:
+
+```typescript
+// casper/mcp/adapter.ts
+import { registry } from "../recipes/mod.ts";
+
+/** Convert recipe params to MCP-compatible JSON Schema. */
+function recipeToSchema(meta: RecipeMeta): object {
+  const properties: Record<string, object> = {};
+  const required: string[] = [];
+
+  for (const [name, param] of Object.entries(meta.params)) {
+    properties[name] = {
+      type: param.type,
+      description: param.description,
+      ...(param.enum ? { enum: param.enum } : {}),
+      ...(param.default !== undefined ? { default: param.default } : {}),
+    };
+    if (param.required) required.push(name);
+  }
+
+  return { type: "object", properties, required };
+}
+
+/** Generate MCP tool list from all registered recipes. */
+export function listTools(): object[] {
+  return [...registry.values()].map(recipe => ({
+    name: recipe.meta.name,
+    description: recipe.meta.description,
+    inputSchema: recipeToSchema(recipe.meta),
+  }));
+}
+
+/** Execute an MCP tool call by dispatching to the matching recipe. */
+export async function callTool(name: string, args: Record<string, unknown>): Promise<object> {
+  const recipe = registry.get(name);
+  if (!recipe) throw new Error(`Unknown tool: ${name}`);
+  const result = await recipe.execute(args);
+  return { content: [{ type: "text", text: JSON.stringify(result) }] };
+}
+```
+
+An LLM client (Claude, GPT, etc.) would see:
+
+```json
+{
+  "tools": [
+    {
+      "name": "spotify.play",
+      "description": "Play a track on Spotify by URI or search query",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "uri": { "type": "string", "description": "Spotify URI" },
+          "query": { "type": "string", "description": "Search query" }
+        }
+      }
+    },
+    {
+      "name": "spotify.now-playing",
+      "description": "Get the currently playing track on Spotify",
+      "inputSchema": { "type": "object", "properties": {} }
+    }
+  ]
+}
+```
+
+### How recipes become skill descriptions
+
+A **skill adapter** auto-generates LLM-readable markdown from recipe metadata
+and app profiles. This is what gets injected into an agent's context — not
+the code itself, but a description of what's available.
+
+```typescript
+// casper/skills/adapter.ts
+import { registry } from "../recipes/mod.ts";
+import { getProfile } from "../profiles/mod.ts";
+
+/** Generate a skill description for an app, combining profile + recipes. */
+export function describeSkill(appBundleId: string): string {
+  const profile = getProfile(appBundleId);
+  const recipes = [...registry.values()]
+    .filter(r => r.meta.app === appBundleId);
+
+  if (!profile && recipes.length === 0) return "";
+
+  let md = `## ${profile?.name ?? appBundleId}\n\n`;
+
+  if (profile?.scriptable) {
+    md += `This app is scriptable via AppleScript.\n\n`;
+  }
+
+  if (recipes.length > 0) {
+    md += `### Available actions\n\n`;
+    for (const recipe of recipes) {
+      md += `- **${recipe.meta.name}**: ${recipe.meta.description}\n`;
+      const params = Object.entries(recipe.meta.params);
+      if (params.length > 0) {
+        for (const [name, param] of params) {
+          const req = param.required ? " (required)" : "";
+          md += `  - \`${name}\`: ${param.description}${req}\n`;
+        }
+      }
+    }
+  }
+
+  if (profile?.shortcuts) {
+    md += `\n### Keyboard shortcuts\n\n`;
+    for (const [action, keys] of Object.entries(profile.shortcuts)) {
+      md += `- ${action}: \`${keys}\`\n`;
+    }
+  }
+
+  return md;
+}
+```
+
+An LLM reading this skill description sees:
+
+```markdown
+## Spotify
+
+This app is scriptable via AppleScript.
+
+### Available actions
+
+- **spotify.play**: Play a track on Spotify by URI or search query
+  - `uri`: Spotify URI (e.g. spotify:track:xxx)
+  - `query`: Search query (uses keyboard shortcut)
+- **spotify.now-playing**: Get the currently playing track on Spotify
+- **spotify.next**: Skip to the next track on Spotify
+- **spotify.volume**: Set Spotify playback volume (0-100)
+  - `level`: Volume level 0-100 (required)
+
+### Keyboard shortcuts
+
+- search: `cmd+k`
+- preferences: `cmd+,`
+- newPlaylist: `cmd+n`
+```
+
+### Recipe registry
+
+```typescript
+// casper/recipes/mod.ts
+import type { Recipe } from "./types.ts";
+import * as spotify from "./spotify.ts";
+import * as browser from "./browser.ts";
+
+export const registry = new Map<string, Recipe<any, any>>();
+
+function register(recipe: Recipe<any, any>): void {
+  registry.set(recipe.meta.name, recipe);
+}
+
+// Spotify
+register(spotify.play);
+register(spotify.nowPlaying);
+register(spotify.next);
+register(spotify.setVolume);
+
+// Browser
+register(browser.navigate);
+register(browser.currentUrl);
+
+export { registry };
+```
+
+### How it compares to OpenClaw skills
+
+| | **OpenClaw Skills** | **Casper Recipes** |
+|---|---|---|
+| **Format** | Markdown prose (SKILL.md) | TypeScript functions with metadata |
+| **Execution** | LLM reads docs, generates CLI commands | Recipe function runs directly |
+| **Type safety** | None — LLM might hallucinate args | Full — TypeScript checks inputs/outputs |
+| **Testability** | Manual | Standard unit tests |
+| **Composability** | LLM chains CLI calls in sequence | `await` chains in TypeScript |
+| **CLI exposure** | Already CLI (that's all it is) | Auto-generated from `meta.params` |
+| **MCP exposure** | Separate MCP server per skill | Auto-generated from `meta.params` |
+| **LLM context** | Injected markdown from SKILL.md | Auto-generated from metadata + profile |
+| **Community** | Publish SKILL.md to ClawHub | Publish Deno module to JSR/npm |
+| **Discoverability** | `skills list` shows name + desc | `casper --help` or MCP `listTools` |
+
+The critical difference: OpenClaw skills teach an LLM what CLI commands to
+run. Casper recipes **are** the commands — they execute directly and
+additionally describe themselves to CLIs, MCP, and LLMs from a single source
+of truth.
+
+### Aligning with Peekaboo's existing architecture
+
+Peekaboo already has a three-track tool system:
+
+```
+CLI Command (Commander) → MCPTool (TachikomaMCP) → AgentTool (Tachikoma)
+```
+
+Casper recipes map cleanly onto this:
+
+| Peekaboo layer | Casper equivalent | How it connects |
+|---|---|---|
+| `AsyncRuntimeCommand` | CLI adapter | `casper <recipe.name> --param value` |
+| `MCPTool` protocol | MCP adapter | Auto-generated JSON schema from `meta.params` |
+| `AgentTool` | Direct recipe call | Agent runtime calls `recipe.execute(args)` |
+| `MCPToolContext` | Entity imports | Recipes use entities directly (no DI needed — FFI is global) |
+| `ToolFiltering` | Recipe filtering | Same allow/deny pattern on recipe names |
+| `UISnapshot` + element IDs | `Snapshot` + refs | Same pattern, different implementation |
+
+The key insight: Peekaboo's `MCPTool` structs each contain ~50 lines of
+boilerplate (schema definition, argument parsing, response formatting) that
+is nearly identical across tools. Recipes collapse this: the `meta` block
+generates all three surfaces (CLI, MCP, skill description) automatically.
+
+### Third-party recipes
+
+Because recipes are Deno modules, anyone can publish them:
+
+```typescript
+// Published as: jsr:@someone/casper-slack
+import { App, Script, Keyboard } from "jsr:@peekaboo/casper";
+import type { Recipe } from "jsr:@peekaboo/casper/recipes";
+
+export const sendMessage: Recipe<{ channel: string; message: string }, void> = {
+  meta: {
+    name: "slack.send",
+    description: "Send a message to a Slack channel",
+    category: "communication",
+    app: "com.tinyspeck.slackmacgap",
+    params: {
+      channel: { type: "string", description: "Channel name", required: true },
+      message: { type: "string", description: "Message text", required: true },
+    },
+  },
+
+  async execute({ channel, message }) {
+    const slack = await App.find("Slack") ?? await App.launch("com.tinyspeck.slackmacgap");
+    await slack.activate();
+    await Keyboard.hotkey("cmd+k");  // Quick switcher
+    const win = await slack.focusedWindow();
+    const switcher = await win.waitFor({ role: "AXTextField" }, 3000);
+    await switcher.type(channel);
+    await Keyboard.press("return");
+    await new Promise(r => setTimeout(r, 500));
+    await Keyboard.type(message);
+    await Keyboard.press("return");
+  },
+};
+```
+
+Install and use:
+
+```
+$ deno install jsr:@someone/casper-slack
+$ casper slack.send --channel general --message "Hello from Casper"
+```
+
+Or in agent code:
+
+```typescript
+import { sendMessage } from "jsr:@someone/casper-slack";
+await sendMessage.execute({ channel: "general", message: "Hello from Casper" });
+```
+
+### Recipes with snapshots
+
+Recipes can use snapshots internally for vision-guided automation:
+
+```typescript
+export const likeCurrentTweet: Recipe<void, void> = {
+  meta: {
+    name: "twitter.like",
+    description: "Like the currently visible tweet in the browser",
+    category: "social",
+    params: {},
+  },
+
+  async execute() {
+    const safari = await App.find("Safari");
+    if (!safari) throw new Error("Safari not running");
+    const win = await safari.focusedWindow();
+
+    using snap = await win.snapshot({ webContentOnly: true });
+
+    // Find the first Like button in the snapshot
+    for (const [ref, el] of snap.refs) {
+      const props = await el.refresh();
+      if (props.role === "AXButton" && props.label === "Like") {
+        await snap.click(ref);
+        return;
+      }
+    }
+    throw new Error("No Like button found on page");
+  },
+};
+```
+
+### Recipes with LLM-in-the-loop
+
+For complex tasks where the agent needs to make decisions, a recipe can
+delegate back to the LLM using the snapshot text:
+
+```typescript
+export const interactWithPage: Recipe<{ instruction: string }, string> = {
+  meta: {
+    name: "browser.interact",
+    description: "Perform an instruction on the current web page using vision",
+    category: "browser",
+    params: {
+      instruction: { type: "string", description: "What to do on the page", required: true },
+    },
+  },
+
+  async execute({ instruction }) {
+    const app = await App.frontmost();
+    const win = await app.focusedWindow();
+    using snap = await win.snapshot({ webContentOnly: true });
+
+    // Return the snapshot text — the calling agent decides what ref to act on.
+    // This recipe is a "look, then ask the LLM, then act" pattern.
+    return snap.text;
+
+    // The agent sees the snapshot text, picks a ref, then calls:
+    //   snap.click(ref)  — via a follow-up tool call
+    // This keeps the LLM in the loop for ambiguous situations
+    // while Casper handles the precise execution.
+  },
+};
+```
+
+---
+
 ## File Layout (updated)
 
 ```
@@ -2590,10 +3263,23 @@ casper/
     │   ├── dialog.ts             # Dialog entity
     │   ├── script.ts             # Script singleton (AppleScript)
     │   └── snapshot.ts           # Snapshot entity (AX tree → text + refs)
-    └── profiles/
-        ├── types.ts              # AppProfile interface
-        ├── mod.ts                # Profile registry
-        ├── spotify.ts            # Spotify profile
-        ├── safari.ts             # Safari profile
-        └── music.ts              # Music profile
+    ├── profiles/
+    │   ├── types.ts              # AppProfile interface
+    │   ├── mod.ts                # Profile registry
+    │   ├── spotify.ts            # Spotify profile
+    │   ├── safari.ts             # Safari profile
+    │   └── music.ts              # Music profile
+    ├── recipes/
+    │   ├── types.ts              # Recipe<TInput, TOutput> interface
+    │   ├── mod.ts                # Recipe registry
+    │   ├── spotify.ts            # Spotify recipes (play, nowPlaying, next, volume)
+    │   └── browser.ts            # Browser recipes (navigate, currentUrl)
+    ├── cli/
+    │   ├── main.ts               # CLI entry point (Deno.args → recipe dispatch)
+    │   └── adapter.ts            # Recipe → CLI subcommand adapter
+    ├── mcp/
+    │   ├── server.ts             # MCP stdio server (Deno)
+    │   └── adapter.ts            # Recipe → MCP tool adapter
+    └── skills/
+        └── adapter.ts            # Recipe + Profile → LLM-readable markdown
 ```
