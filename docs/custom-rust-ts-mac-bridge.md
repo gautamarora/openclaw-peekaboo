@@ -1,34 +1,37 @@
-# Building a TypeScript + Rust Mac Automation Bridge
+# Building a TypeScript + Rust Mac Automation Bridge (Deno + FFI)
 
-Design document for building your own IPC bridge to macOS automation services,
-replacing Peekaboo's Swift stack with TypeScript (agent orchestrator) and Rust
-(native macOS API calls), connected via napi-rs.
+Design document for building your own Mac automation bridge with TypeScript
+(Deno) as the agent orchestrator and Rust as the native layer calling macOS
+APIs directly. Connected via `Deno.dlopen` FFI — no napi-rs, no Node.js, no
+socket protocol.
 
 ## Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  TypeScript Agent (Node.js)                                  │
+│  Deno Process                                                │
 │                                                              │
 │  agent.ts  ─── orchestrator / LLM loop                      │
 │    ↓                                                         │
-│  mac-bridge.ts  ─── typed wrapper around napi bindings       │
+│  mac-bridge.ts  ─── typed wrappers around FFI symbols        │
 │    ↓                                                         │
-│  @anthropic/mac-bridge (napi-rs)  ─── native Node addon      │
-│    ↓                                                         │
-│  Rust crate: mac-bridge-core                                 │
-│    ├── input.rs      ─── CGEvent (mouse, keyboard, scroll)  │
-│    ├── ax.rs         ─── AXUIElement (accessibility tree)    │
-│    ├── capture.rs    ─── CGWindowList / ScreenCaptureKit     │
-│    ├── apps.rs       ─── NSWorkspace / NSRunningApplication  │
-│    ├── windows.rs    ─── AX window attrs + CGWindowList      │
-│    ├── clipboard.rs  ─── NSPasteboard                        │
-│    ├── permissions.rs─── TCC permission checks               │
-│    └── screen.rs     ─── NSScreen display enumeration        │
+│  Deno.dlopen("libmacbridge.dylib", symbols)                  │
+│    ↓  (C ABI function calls — no serialization)              │
+│                                                              │
+│  Rust cdylib: libmacbridge.dylib                             │
+│    ├── ffi.rs       ─── extern "C" entry points for Deno     │
+│    ├── input.rs     ─── CGEvent (mouse, keyboard, scroll)    │
+│    ├── ax.rs        ─── AXUIElement (accessibility tree)     │
+│    ├── capture.rs   ─── CGWindowList / ScreenCaptureKit      │
+│    ├── apps.rs      ─── NSWorkspace / NSRunningApplication   │
+│    ├── windows.rs   ─── AX window attrs + CGWindowList       │
+│    ├── clipboard.rs ─── NSPasteboard                         │
+│    ├── permissions.rs── TCC permission checks                │
+│    └── screen.rs    ─── NSScreen display enumeration         │
 └──────────────────────────────────────────────────────────────┘
-         ↓ calls directly via FFI ↓
+         ↓ linked at build time ↓
 ┌──────────────────────────────────────────────────────────────┐
-│  macOS Frameworks (linked at build time)                     │
+│  macOS Frameworks                                            │
 │                                                              │
 │  ApplicationServices.framework                               │
 │    ├── AXUIElement*  (Accessibility)                         │
@@ -37,10 +40,6 @@ replacing Peekaboo's Swift stack with TypeScript (agent orchestrator) and Rust
 │    ├── CGWindowList* (window enumeration + legacy capture)   │
 │    ├── CGDisplay*    (display info + legacy capture)         │
 │    └── CGImage*      (image handling)                        │
-│  ScreenCaptureKit.framework  (macOS 13+)                     │
-│    ├── SCShareableContent                                    │
-│    ├── SCScreenshotManager                                   │
-│    └── SCContentFilter / SCStreamConfiguration               │
 │  AppKit.framework                                            │
 │    ├── NSWorkspace    (app launch, running apps)             │
 │    ├── NSRunningApplication (app control)                    │
@@ -52,72 +51,108 @@ replacing Peekaboo's Swift stack with TypeScript (agent orchestrator) and Rust
 └──────────────────────────────────────────────────────────────┘
 ```
 
-### Why This Architecture
+### Why Deno + Deno.dlopen
 
-- **No external daemon needed** — your process directly holds TCC permissions
-  and calls macOS APIs. No socket protocol, no auth handshake, no Peekaboo
-  dependency.
-- **napi-rs** gives you synchronous and async Rust functions callable from
-  TypeScript with zero-copy where possible. The N-API boundary is a function
-  call, not serialization.
-- **Single process** — the Node.js runtime, your TS agent, and the Rust native
-  code all live in one process. TCC grants (Accessibility, Screen Recording)
-  apply to this one process.
+- **No napi-rs** — `Deno.dlopen` loads any `.dylib` that exports C functions.
+  The Rust side just needs `extern "C"` + `#[no_mangle]`. No build tooling,
+  no codegen, no `@napi-rs/cli`.
+- **No Node.js** — Deno has built-in TypeScript, top-level await, permissions
+  model, and `Deno.dlopen` in the standard runtime. No `package.json`, no
+  `node_modules`.
+- **Single process** — the Deno runtime and the Rust `.dylib` share an address
+  space. TCC grants (Accessibility, Screen Recording) apply to the single
+  Deno process.
+- **Zero serialization for primitives** — `Deno.dlopen` maps C types directly
+  to JS: `f64`, `i32`, `u32`, `bool`, `pointer`, `buffer`. No JSON
+  encode/decode for simple calls like `click(x, y)`.
+
+### How Deno FFI Works
+
+```typescript
+// Load the compiled .dylib
+const lib = Deno.dlopen("./target/release/libmacbridge.dylib", {
+  // Each symbol: { parameters: [...types], result: type }
+  mac_click: { parameters: ["f64", "f64", "u8", "u32"], result: "i32" },
+  mac_hotkey: { parameters: ["buffer", "u32", "u64"], result: "i32" },
+  mac_capture_screen: { parameters: ["pointer"], result: "pointer" },
+  mac_free_buffer: { parameters: ["pointer", "u64"], result: "void" },
+});
+
+// Call it — Deno passes args directly to the C function
+lib.symbols.mac_click(500.0, 300.0, 0, 1); // left click at (500, 300)
+```
+
+Deno FFI supports these C-to-JS type mappings:
+
+| FFI type | C type | Rust type | JS type |
+|---|---|---|---|
+| `"i32"` | `int32_t` | `i32` | `number` |
+| `"u32"` | `uint32_t` | `u32` | `number` |
+| `"i64"` | `int64_t` | `i64` | `number \| bigint` |
+| `"u64"` | `uint64_t` | `u64` | `number \| bigint` |
+| `"f32"` | `float` | `f32` | `number` |
+| `"f64"` | `double` | `f64` | `number` |
+| `"u8"` | `uint8_t` | `u8` | `number` |
+| `"bool"` | `bool` | `bool` | `boolean` |
+| `"pointer"` | `void*` | `*mut T` | `Deno.PointerObject \| null` |
+| `"buffer"` | `void*` | `*const u8` | `Uint8Array` (param only) |
+| `"void"` | `void` | `()` | `undefined` |
+
+**Key constraint**: `Deno.dlopen` can only pass/return C primitives and
+pointers. For complex data (strings, structs, arrays), the pattern is:
+1. Rust allocates and returns a pointer + length
+2. Deno reads via `Deno.UnsafePointerView`
+3. Deno calls a `free` function to release the Rust allocation
 
 ### TCC Permissions
 
-Your Node.js process needs these macOS permissions (granted to the terminal
-or to your Electron/.app wrapper):
+Your Deno process needs these macOS permissions (granted to the terminal
+emulator or to a Tauri/.app wrapper):
 
 | Permission | Needed for | System Preferences path |
 |---|---|---|
 | **Accessibility** | AXUIElement, CGEvent input | Privacy & Security → Accessibility |
-| **Screen Recording** | SCScreenshotManager, CGWindowListCreateImage | Privacy & Security → Screen Recording |
-| **Automation** (optional) | NSAppleScript, app launch/quit via AppleScript | Privacy & Security → Automation |
+| **Screen Recording** | CGWindowListCreateImage, SCScreenshotManager | Privacy & Security → Screen Recording |
+| **Automation** (optional) | NSAppleScript, app control via AppleScript | Privacy & Security → Automation |
 
-If you run from Terminal.app or iTerm, the terminal itself needs the grants.
-If you package as an .app (Electron, Tauri), the .app bundle gets the grants.
+If you run Deno from Terminal.app or iTerm, the **terminal** needs the grants.
+If you wrap Deno in a Tauri app, the **.app bundle** gets the grants.
 
 ---
 
 ## Part 1: Rust Crate Structure
 
-### Cargo workspace
-
 ```
 mac-bridge/
-├── Cargo.toml              # workspace root
-├── crates/
-│   ├── mac-bridge-core/    # pure Rust, no napi dependency
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── input.rs        # mouse, keyboard, scroll
-│   │       ├── ax.rs           # accessibility tree
-│   │       ├── capture.rs      # screen capture
-│   │       ├── apps.rs         # application management
-│   │       ├── windows.rs      # window management
-│   │       ├── clipboard.rs    # pasteboard
-│   │       ├── permissions.rs  # TCC checks
-│   │       ├── screen.rs       # display enumeration
-│   │       └── types.rs        # shared types
-│   └── mac-bridge-napi/    # napi-rs bindings (thin layer)
-│       ├── Cargo.toml
-│       └── src/
-│           └── lib.rs      # #[napi] exports wrapping core
-├── package.json            # npm package config
-├── index.d.ts              # generated TypeScript types
-└── ts/
-    └── mac-bridge.ts       # high-level TS wrapper
+├── Cargo.toml
+├── build.rs               # link macOS frameworks
+├── src/
+│   ├── lib.rs             # module declarations
+│   ├── ffi.rs             # all extern "C" exports (Deno calls these)
+│   ├── ffi_types.rs       # FFI-safe types and buffer helpers
+│   ├── input.rs           # CGEvent mouse, keyboard, scroll
+│   ├── ax.rs              # AXUIElement accessibility tree
+│   ├── capture.rs         # screen capture (CGWindowList)
+│   ├── apps.rs            # NSWorkspace / NSRunningApplication
+│   ├── clipboard.rs       # NSPasteboard
+│   └── permissions.rs     # TCC checks
+└── deno/
+    ├── deno.json           # Deno project config
+    ├── mod.ts              # main entry — Deno.dlopen + symbol defs
+    ├── mac_bridge.ts       # high-level typed API
+    └── agent.ts            # example agent loop
 ```
 
-### Dependencies (Cargo.toml for mac-bridge-core)
+### Cargo.toml
 
 ```toml
 [package]
-name = "mac-bridge-core"
+name = "mac-bridge"
 version = "0.1.0"
 edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]    # produces libmacbridge.dylib
 
 [dependencies]
 core-foundation = "0.10"
@@ -131,1241 +166,872 @@ objc2-foundation = { version = "0.3", features = [
     "NSString", "NSArray", "NSDictionary", "NSURL",
     "NSProcessInfo"
 ] }
-block2 = "0.6"
-thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-base64 = "0.22"
+thiserror = "2"
 png = "0.17"
-
-[build-dependencies]
-cc = "1"   # for linking .m bridging files if needed
+libc = "0.2"
 ```
 
-### Dependencies (Cargo.toml for mac-bridge-napi)
+### build.rs — Link macOS Frameworks
 
-```toml
-[package]
-name = "mac-bridge-napi"
-version = "0.1.0"
-edition = "2021"
-
-[lib]
-crate-type = ["cdylib"]
-
-[dependencies]
-mac-bridge-core = { path = "../mac-bridge-core" }
-napi = { version = "3", features = ["async", "napi9", "serde"] }
-napi-derive = "3"
-serde_json = "1"
-
-[build-dependencies]
-napi-build = "2"
+```rust
+fn main() {
+    println!("cargo:rustc-link-lib=framework=ApplicationServices");
+    println!("cargo:rustc-link-lib=framework=CoreGraphics");
+    println!("cargo:rustc-link-lib=framework=AppKit");
+    println!("cargo:rustc-link-lib=framework=CoreFoundation");
+}
 ```
 
 ---
 
-## Part 2: Rust Implementation — macOS API Calls
+## Part 2: FFI Boundary Layer (ffi.rs)
 
-### 2.1 Input Simulation (input.rs)
+This is the critical file. It's the contract between Deno and Rust. Every
+function is `extern "C"` with `#[no_mangle]` and only uses C-safe types.
 
-This replaces Peekaboo's `ClickService`, `HotkeyService`, `ScrollService`,
-`GestureService`, all of which delegate to AXorcist's `InputDriver`.
-
-The underlying C APIs are in `ApplicationServices.framework`:
-
-```rust
-// input.rs
-use core_graphics::event::{
-    CGEvent, CGEventTapLocation, CGEventType, CGMouseButton,
-    CGEventFlags, ScrollEventUnit,
-};
-use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
-use core_graphics::geometry::CGPoint;
-
-/// Create an event source for synthetic events.
-fn event_source() -> CGEventSource {
-    CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-        .expect("failed to create event source")
-}
-
-/// Move the mouse cursor to a point.
-pub fn mouse_move(x: f64, y: f64) -> Result<(), InputError> {
-    let source = event_source();
-    let point = CGPoint::new(x, y);
-    let event = CGEvent::new_mouse_event(
-        source,
-        CGEventType::MouseMoved,
-        point,
-        CGMouseButton::Left, // ignored for move events
-    ).map_err(|_| InputError::EventCreation)?;
-    event.post(CGEventTapLocation::HID);
-    Ok(())
-}
-
-/// Click at a point.
-pub fn click(x: f64, y: f64, button: MouseButton, count: u32) -> Result<(), InputError> {
-    let source = event_source();
-    let point = CGPoint::new(x, y);
-
-    let (down_type, up_type, cg_button) = match button {
-        MouseButton::Left => (
-            CGEventType::LeftMouseDown,
-            CGEventType::LeftMouseUp,
-            CGMouseButton::Left,
-        ),
-        MouseButton::Right => (
-            CGEventType::RightMouseDown,
-            CGEventType::RightMouseUp,
-            CGMouseButton::Right,
-        ),
-    };
-
-    for i in 0..count {
-        let down = CGEvent::new_mouse_event(source.clone(), down_type, point, cg_button)
-            .map_err(|_| InputError::EventCreation)?;
-        let up = CGEvent::new_mouse_event(source.clone(), up_type, point, cg_button)
-            .map_err(|_| InputError::EventCreation)?;
-
-        // Set click count for double/triple clicks
-        let click_number = (i + 1) as i64;
-        down.set_integer_value_field(
-            core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE,
-            click_number,
-        );
-        up.set_integer_value_field(
-            core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE,
-            click_number,
-        );
-
-        down.post(CGEventTapLocation::HID);
-        up.post(CGEventTapLocation::HID);
-    }
-    Ok(())
-}
-
-/// Press a keyboard shortcut. Keys string like "cmd+shift+s".
-pub fn hotkey(keys: &str, hold_duration_ms: u64) -> Result<(), InputError> {
-    let source = event_source();
-    let parts: Vec<&str> = keys.split('+').map(str::trim).collect();
-
-    let mut flags = CGEventFlags::empty();
-    let mut key_code: Option<u16> = None;
-
-    for part in &parts {
-        match part.to_lowercase().as_str() {
-            "cmd" | "command" => flags |= CGEventFlags::CGEventFlagCommand,
-            "shift"           => flags |= CGEventFlags::CGEventFlagShift,
-            "ctrl" | "control"=> flags |= CGEventFlags::CGEventFlagControl,
-            "alt" | "option"  => flags |= CGEventFlags::CGEventFlagAlternate,
-            other             => key_code = Some(keycode_for_name(other)?),
-        }
-    }
-
-    let code = key_code.ok_or(InputError::NoKeySpecified)?;
-
-    // Key down
-    let down = CGEvent::new_keyboard_event(source.clone(), code, true)
-        .map_err(|_| InputError::EventCreation)?;
-    down.set_flags(flags);
-    down.post(CGEventTapLocation::HID);
-
-    if hold_duration_ms > 0 {
-        std::thread::sleep(std::time::Duration::from_millis(hold_duration_ms));
-    }
-
-    // Key up
-    let up = CGEvent::new_keyboard_event(source, code, false)
-        .map_err(|_| InputError::EventCreation)?;
-    up.set_flags(flags);
-    up.post(CGEventTapLocation::HID);
-
-    Ok(())
-}
-
-/// Type a string character by character using CGEvent keyboard events.
-pub fn type_text(text: &str, delay_ms: u64) -> Result<(), InputError> {
-    let source = event_source();
-    for ch in text.chars() {
-        // Use CGEvent's key_from_char or Unicode input
-        let event = CGEvent::new_keyboard_event(source.clone(), 0, true)
-            .map_err(|_| InputError::EventCreation)?;
-        // Set the Unicode string directly on the event
-        let chars = [ch as u16];
-        unsafe {
-            // CGEventKeyboardSetUnicodeString
-            core_graphics::sys::CGEventKeyboardSetUnicodeString(
-                event.as_concrete_TypeRef(),
-                chars.len() as libc::c_ulong,
-                chars.as_ptr(),
-            );
-        }
-        event.post(CGEventTapLocation::HID);
-
-        let up = CGEvent::new_keyboard_event(source.clone(), 0, false)
-            .map_err(|_| InputError::EventCreation)?;
-        up.post(CGEventTapLocation::HID);
-
-        if delay_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-        }
-    }
-    Ok(())
-}
-
-/// Scroll at a point.
-pub fn scroll(delta_x: i32, delta_y: i32) -> Result<(), InputError> {
-    let source = event_source();
-    let event = CGEvent::new_scroll_event(
-        source,
-        ScrollEventUnit::LINE,
-        2,       // axis count
-        delta_y, // vertical first
-        delta_x, // horizontal second
-        0,
-    ).map_err(|_| InputError::EventCreation)?;
-    event.post(CGEventTapLocation::HID);
-    Ok(())
-}
-
-/// Drag from one point to another with intermediate steps.
-pub fn drag(
-    from_x: f64, from_y: f64,
-    to_x: f64, to_y: f64,
-    steps: u32,
-    step_delay_ms: u64,
-) -> Result<(), InputError> {
-    let source = event_source();
-    let from = CGPoint::new(from_x, from_y);
-
-    // Mouse down at start
-    let down = CGEvent::new_mouse_event(
-        source.clone(), CGEventType::LeftMouseDown, from, CGMouseButton::Left,
-    ).map_err(|_| InputError::EventCreation)?;
-    down.post(CGEventTapLocation::HID);
-
-    // Interpolated drag steps
-    for i in 1..=steps {
-        let t = i as f64 / steps as f64;
-        let x = from_x + (to_x - from_x) * t;
-        let y = from_y + (to_y - from_y) * t;
-        let point = CGPoint::new(x, y);
-
-        let drag_event = CGEvent::new_mouse_event(
-            source.clone(), CGEventType::LeftMouseDragged, point, CGMouseButton::Left,
-        ).map_err(|_| InputError::EventCreation)?;
-        drag_event.post(CGEventTapLocation::HID);
-
-        std::thread::sleep(std::time::Duration::from_millis(step_delay_ms));
-    }
-
-    // Mouse up at end
-    let up = CGEvent::new_mouse_event(
-        source, CGEventType::LeftMouseUp, CGPoint::new(to_x, to_y), CGMouseButton::Left,
-    ).map_err(|_| InputError::EventCreation)?;
-    up.post(CGEventTapLocation::HID);
-
-    Ok(())
-}
-
-/// Map key names to macOS virtual key codes.
-fn keycode_for_name(name: &str) -> Result<u16, InputError> {
-    match name {
-        "a" => Ok(0x00), "s" => Ok(0x01), "d" => Ok(0x02), "f" => Ok(0x03),
-        "h" => Ok(0x04), "g" => Ok(0x05), "z" => Ok(0x06), "x" => Ok(0x07),
-        "c" => Ok(0x08), "v" => Ok(0x09), "b" => Ok(0x0B), "q" => Ok(0x0C),
-        "w" => Ok(0x0D), "e" => Ok(0x0E), "r" => Ok(0x0F), "y" => Ok(0x10),
-        "t" => Ok(0x11), "1" => Ok(0x12), "2" => Ok(0x13), "3" => Ok(0x14),
-        "4" => Ok(0x15), "6" => Ok(0x16), "5" => Ok(0x17), "9" => Ok(0x19),
-        "7" => Ok(0x1A), "8" => Ok(0x1C), "0" => Ok(0x1D),
-        "return" | "enter" => Ok(0x24),
-        "tab"              => Ok(0x30),
-        "space"            => Ok(0x31),
-        "delete"           => Ok(0x33),
-        "escape" | "esc"   => Ok(0x35),
-        "left"             => Ok(0x7B),
-        "right"            => Ok(0x7C),
-        "down"             => Ok(0x7D),
-        "up"               => Ok(0x7E),
-        "f1"               => Ok(0x7A),
-        "f2"               => Ok(0x78),
-        "f3"               => Ok(0x63),
-        "f4"               => Ok(0x76),
-        "f5"               => Ok(0x60),
-        // ... extend as needed
-        other => Err(InputError::UnknownKey(other.to_string())),
-    }
-}
-
-#[derive(Debug)]
-pub enum MouseButton { Left, Right }
-
-#[derive(Debug, thiserror::Error)]
-pub enum InputError {
-    #[error("failed to create CGEvent")]
-    EventCreation,
-    #[error("no key specified in hotkey string")]
-    NoKeySpecified,
-    #[error("unknown key name: {0}")]
-    UnknownKey(String),
-}
-```
-
-### 2.2 Accessibility Tree (ax.rs)
-
-This replaces Peekaboo's AXorcist dependency. The raw C API is in
-`ApplicationServices.framework` (`HIServices` sub-framework).
+For complex returns (JSON strings, PNG bytes), the pattern is:
+- Rust serializes to JSON or encodes to PNG
+- Writes the data into a heap-allocated buffer
+- Returns a pointer + writes the length to an out-parameter
+- Deno reads the data, then calls `mac_free_buffer` to release it
 
 ```rust
-// ax.rs
-//
-// AXUIElement is a C API. Rust calls it via FFI.
-// The core-foundation crate provides CFType wrappers;
-// we declare the AX functions ourselves.
+// ffi.rs — all functions Deno.dlopen sees
 
-use core_foundation::base::{CFType, TCFType, CFTypeRef, Boolean};
-use core_foundation::string::{CFString, CFStringRef};
-use core_foundation::array::{CFArray, CFArrayRef};
-use std::ffi::c_void;
+use std::ffi::{CStr, CString};
+use std::os::raw::c_char;
 use std::ptr;
 
-// --- FFI declarations ---
+// =================================================================
+// Buffer helpers — how Rust returns variable-length data to Deno
+// =================================================================
 
+/// Allocate a byte buffer on the Rust heap. Returns pointer.
+/// Deno reads `len` bytes via UnsafePointerView, then calls mac_free_buffer.
 #[repr(C)]
-pub struct __AXUIElement(c_void);
-pub type AXUIElementRef = *mut __AXUIElement;
-
-pub type AXError = i32;
-pub const kAXErrorSuccess: AXError = 0;
-pub const kAXErrorNoValue: AXError = -25212;
-
-extern "C" {
-    fn AXUIElementCreateSystemWide() -> AXUIElementRef;
-    fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
-    fn AXUIElementCopyAttributeValue(
-        element: AXUIElementRef,
-        attribute: CFStringRef,
-        value: *mut CFTypeRef,
-    ) -> AXError;
-    fn AXUIElementCopyAttributeNames(
-        element: AXUIElementRef,
-        names: *mut CFArrayRef,
-    ) -> AXError;
-    fn AXUIElementPerformAction(
-        element: AXUIElementRef,
-        action: CFStringRef,
-    ) -> AXError;
-    fn AXUIElementSetAttributeValue(
-        element: AXUIElementRef,
-        attribute: CFStringRef,
-        value: CFTypeRef,
-    ) -> AXError;
-    fn AXUIElementCopyElementAtPosition(
-        application: AXUIElementRef,
-        x: f32,
-        y: f32,
-        element: *mut AXUIElementRef,
-    ) -> AXError;
-    fn AXUIElementGetPid(
-        element: AXUIElementRef,
-        pid: *mut i32,
-    ) -> AXError;
-    fn AXUIElementSetMessagingTimeout(
-        element: AXUIElementRef,
-        timeout_in_seconds: f32,
-    ) -> AXError;
-    fn AXIsProcessTrusted() -> Boolean;
-    fn AXIsProcessTrustedWithOptions(options: core_foundation::dictionary::CFDictionaryRef) -> Boolean;
+pub struct FfiBuffer {
+    pub ptr: *mut u8,
+    pub len: u64,
 }
 
-// --- Safe wrappers ---
-
-/// Check if this process has Accessibility permission.
-pub fn is_trusted() -> bool {
-    unsafe { AXIsProcessTrusted() != 0 }
-}
-
-/// Get the system-wide AXUIElement.
-pub fn system_wide() -> AXElement {
-    AXElement { raw: unsafe { AXUIElementCreateSystemWide() } }
-}
-
-/// Get the AXUIElement for an application by PID.
-pub fn application(pid: i32) -> AXElement {
-    AXElement { raw: unsafe { AXUIElementCreateApplication(pid) } }
-}
-
-/// Wrapper around AXUIElementRef with safe attribute access.
-pub struct AXElement {
-    raw: AXUIElementRef,
-}
-
-// AXUIElementRef is CFType-based and follows CFRetain/CFRelease.
-impl Drop for AXElement {
-    fn drop(&mut self) {
-        if !self.raw.is_null() {
-            unsafe { core_foundation::base::CFRelease(self.raw as CFTypeRef) };
-        }
-    }
-}
-
-impl AXElement {
-    /// Get a string attribute (e.g. "AXTitle", "AXRole", "AXValue").
-    pub fn string_attr(&self, name: &str) -> Option<String> {
-        let cf_name = CFString::new(name);
-        let mut value: CFTypeRef = ptr::null_mut();
-        let err = unsafe {
-            AXUIElementCopyAttributeValue(self.raw, cf_name.as_concrete_TypeRef(), &mut value)
-        };
-        if err != kAXErrorSuccess || value.is_null() {
-            return None;
-        }
-        // Try to cast to CFString
-        let cf_str = unsafe { CFString::wrap_under_create_rule(value as CFStringRef) };
-        Some(cf_str.to_string())
-    }
-
-    /// Get an array attribute (e.g. "AXChildren", "AXWindows").
-    pub fn children(&self) -> Vec<AXElement> {
-        self.array_attr("AXChildren")
-    }
-
-    pub fn windows(&self) -> Vec<AXElement> {
-        self.array_attr("AXWindows")
-    }
-
-    fn array_attr(&self, name: &str) -> Vec<AXElement> {
-        let cf_name = CFString::new(name);
-        let mut value: CFTypeRef = ptr::null_mut();
-        let err = unsafe {
-            AXUIElementCopyAttributeValue(self.raw, cf_name.as_concrete_TypeRef(), &mut value)
-        };
-        if err != kAXErrorSuccess || value.is_null() {
-            return vec![];
-        }
-        let array = unsafe { CFArray::wrap_under_create_rule(value as CFArrayRef) };
-        let mut result = Vec::new();
-        for i in 0..array.len() {
-            let elem_ref = array.get(i).expect("array index");
-            // Retain the element since we're storing it
-            unsafe { core_foundation::base::CFRetain(elem_ref as CFTypeRef) };
-            result.push(AXElement { raw: elem_ref as AXUIElementRef });
-        }
-        result
-    }
-
-    /// Get the element's role (e.g. "AXButton", "AXTextField").
-    pub fn role(&self) -> Option<String> {
-        self.string_attr("AXRole")
-    }
-
-    /// Get the element's title.
-    pub fn title(&self) -> Option<String> {
-        self.string_attr("AXTitle")
-    }
-
-    /// Get the element's label (AXDescription in AX terms).
-    pub fn label(&self) -> Option<String> {
-        self.string_attr("AXDescription")
-    }
-
-    /// Get the element's value as string.
-    pub fn value(&self) -> Option<String> {
-        self.string_attr("AXValue")
-    }
-
-    /// Get element position as (x, y).
-    pub fn position(&self) -> Option<(f64, f64)> {
-        self.point_attr("AXPosition")
-    }
-
-    /// Get element size as (w, h).
-    pub fn size(&self) -> Option<(f64, f64)> {
-        self.point_attr("AXSize")
-    }
-
-    /// Get element bounds as (x, y, w, h).
-    pub fn frame(&self) -> Option<(f64, f64, f64, f64)> {
-        let (x, y) = self.position()?;
-        let (w, h) = self.size()?;
-        Some((x, y, w, h))
-    }
-
-    fn point_attr(&self, name: &str) -> Option<(f64, f64)> {
-        let cf_name = CFString::new(name);
-        let mut value: CFTypeRef = ptr::null_mut();
-        let err = unsafe {
-            AXUIElementCopyAttributeValue(self.raw, cf_name.as_concrete_TypeRef(), &mut value)
-        };
-        if err != kAXErrorSuccess || value.is_null() {
-            return None;
-        }
-        // AXValue wraps CGPoint/CGSize. Extract via AXValueGetValue.
-        // We need to use the AXValue C API here.
-        let mut point = core_graphics::geometry::CGPoint::new(0.0, 0.0);
-        let ok = unsafe {
-            AXValueGetValue(
-                value as AXValueRef,
-                kAXValueCGPointType,
-                &mut point as *mut _ as *mut c_void,
-            )
-        };
-        unsafe { core_foundation::base::CFRelease(value) };
-        if ok != 0 { Some((point.x, point.y)) } else { None }
-    }
-
-    /// Perform an action (e.g. "AXPress", "AXConfirm", "AXRaise").
-    pub fn perform_action(&self, action: &str) -> Result<(), AXError> {
-        let cf_action = CFString::new(action);
-        let err = unsafe { AXUIElementPerformAction(self.raw, cf_action.as_concrete_TypeRef()) };
-        if err == kAXErrorSuccess { Ok(()) } else { Err(err) }
-    }
-
-    /// Set an attribute value (e.g. set AXPosition to move a window).
-    pub fn set_position(&self, x: f64, y: f64) -> Result<(), AXError> {
-        let point = core_graphics::geometry::CGPoint::new(x, y);
-        let ax_value = unsafe {
-            AXValueCreate(kAXValueCGPointType, &point as *const _ as *const c_void)
-        };
-        let cf_name = CFString::new("AXPosition");
-        let err = unsafe {
-            AXUIElementSetAttributeValue(self.raw, cf_name.as_concrete_TypeRef(), ax_value as CFTypeRef)
-        };
-        unsafe { core_foundation::base::CFRelease(ax_value as CFTypeRef) };
-        if err == kAXErrorSuccess { Ok(()) } else { Err(err) }
-    }
-
-    pub fn set_size(&self, w: f64, h: f64) -> Result<(), AXError> {
-        let size = core_graphics::geometry::CGSize::new(w, h);
-        let ax_value = unsafe {
-            AXValueCreate(kAXValueCGSizeType, &size as *const _ as *const c_void)
-        };
-        let cf_name = CFString::new("AXSize");
-        let err = unsafe {
-            AXUIElementSetAttributeValue(self.raw, cf_name.as_concrete_TypeRef(), ax_value as CFTypeRef)
-        };
-        unsafe { core_foundation::base::CFRelease(ax_value as CFTypeRef) };
-        if err == kAXErrorSuccess { Ok(()) } else { Err(err) }
-    }
-
-    /// Set the messaging timeout for this element.
-    pub fn set_timeout(&self, seconds: f32) {
-        unsafe { AXUIElementSetMessagingTimeout(self.raw, seconds) };
-    }
-
-    /// Get the PID of the process that owns this element.
-    pub fn pid(&self) -> Option<i32> {
-        let mut pid: i32 = 0;
-        let err = unsafe { AXUIElementGetPid(self.raw, &mut pid) };
-        if err == kAXErrorSuccess { Some(pid) } else { None }
-    }
-
-    /// Get the element at a screen coordinate (for the given app).
-    pub fn element_at_position(&self, x: f32, y: f32) -> Option<AXElement> {
-        let mut element: AXUIElementRef = ptr::null_mut();
-        let err = unsafe {
-            AXUIElementCopyElementAtPosition(self.raw, x, y, &mut element)
-        };
-        if err == kAXErrorSuccess && !element.is_null() {
-            Some(AXElement { raw: element })
-        } else {
-            None
-        }
-    }
-
-    /// Walk the AX tree and collect elements matching a predicate.
-    pub fn find_all<F>(&self, max_depth: usize, predicate: &F) -> Vec<AXElement>
-    where
-        F: Fn(&AXElement) -> bool,
-    {
-        let mut results = Vec::new();
-        self.walk(max_depth, 0, predicate, &mut results);
-        results
-    }
-
-    fn walk<F>(&self, max_depth: usize, depth: usize, predicate: &F, results: &mut Vec<AXElement>)
-    where
-        F: Fn(&AXElement) -> bool,
-    {
-        if depth > max_depth { return; }
-        if predicate(self) {
-            // Retain since we're storing a reference
-            unsafe { core_foundation::base::CFRetain(self.raw as CFTypeRef) };
-            results.push(AXElement { raw: self.raw });
-        }
-        for child in self.children() {
-            child.walk(max_depth, depth + 1, predicate, results);
-        }
-    }
-}
-
-// --- Additional FFI for AXValue ---
-
-type AXValueRef = *const c_void;
-const kAXValueCGPointType: u32 = 1;
-const kAXValueCGSizeType: u32 = 2;
-
-extern "C" {
-    fn AXValueCreate(value_type: u32, value: *const c_void) -> AXValueRef;
-    fn AXValueGetValue(value: AXValueRef, value_type: u32, out: *mut c_void) -> Boolean;
-}
-```
-
-### 2.3 Screen Capture (capture.rs)
-
-Two paths: modern ScreenCaptureKit (macOS 13+) and legacy CGWindowList.
-
-```rust
-// capture.rs
-use core_graphics::display::{
-    CGDisplay, CGWindowListCopyWindowInfo,
-    kCGWindowListOptionAll, kCGWindowListExcludeDesktopElements,
-    kCGNullWindowID,
-};
-use core_graphics::image::CGImage;
-use core_graphics::geometry::CGRect;
-
-/// Capture the entire main display using the legacy CGDisplay API.
-/// Works on all macOS versions, no ScreenCaptureKit needed.
-pub fn capture_display(display_id: u32) -> Result<Vec<u8>, CaptureError> {
-    let image = CGDisplay::image(display_id)
-        .ok_or(CaptureError::DisplayCaptureFailed)?;
-    image_to_png(&image)
-}
-
-/// Capture a specific window by its CGWindowID using legacy API.
-pub fn capture_window(window_id: u32) -> Result<Vec<u8>, CaptureError> {
-    let cg_rect = CGRect::null(); // .infinite captures full window
-    let image = unsafe {
-        // CGWindowListCreateImage(rect, listOption, windowID, imageOption)
-        CGImage::from_window_list(
-            cg_rect,
-            core_graphics::display::kCGWindowListOptionIncludingWindow,
-            window_id,
-            core_graphics::display::kCGWindowImageBoundsIgnoreFraming
-                | core_graphics::display::kCGWindowImageBestResolution,
-        )
-    }.ok_or(CaptureError::WindowCaptureFailed)?;
-    image_to_png(&image)
-}
-
-/// List all on-screen windows via CGWindowListCopyWindowInfo.
-/// Returns (window_id, pid, title, bounds) tuples.
-pub fn list_windows() -> Vec<WindowInfo> {
-    let info = unsafe {
-        CGWindowListCopyWindowInfo(
-            kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements,
-            kCGNullWindowID,
-        )
-    };
-    // info is a CFArray of CFDictionary. Parse each entry.
-    // Extract: kCGWindowNumber, kCGWindowOwnerPID, kCGWindowName, kCGWindowBounds
-    parse_window_list(info)
-}
-
-/// Encode a CGImage as PNG bytes.
-fn image_to_png(image: &CGImage) -> Result<Vec<u8>, CaptureError> {
-    let width = image.width();
-    let height = image.height();
-    let data = image.data(); // CFData with raw pixels
-    let bytes = data.bytes();
-
-    let mut png_bytes = Vec::new();
-    let mut encoder = png::Encoder::new(&mut png_bytes, width as u32, height as u32);
-    encoder.set_color(png::ColorType::Rgba);
-    encoder.set_depth(png::BitDepth::Eight);
-    let mut writer = encoder.write_header()
-        .map_err(|_| CaptureError::PngEncodeFailed)?;
-
-    // CGImage pixel data may have extra bytes_per_row padding
-    let bpr = image.bytes_per_row();
-    let expected_bpr = width * 4;
-    if bpr == expected_bpr {
-        writer.write_image_data(bytes).map_err(|_| CaptureError::PngEncodeFailed)?;
-    } else {
-        // Strip row padding
-        let mut stripped = Vec::with_capacity(height * expected_bpr);
-        for row in 0..height {
-            let start = row * bpr;
-            stripped.extend_from_slice(&bytes[start..start + expected_bpr]);
-        }
-        writer.write_image_data(&stripped).map_err(|_| CaptureError::PngEncodeFailed)?;
-    }
-
-    drop(writer);
-    Ok(png_bytes)
-}
-
-// For ScreenCaptureKit (macOS 13+), you'd use objc2 to call the
-// Objective-C API. This requires an async bridge since SCK is
-// callback-based. See section 2.3.1 below.
-```
-
-#### 2.3.1 ScreenCaptureKit via objc2 (optional, macOS 13+)
-
-ScreenCaptureKit is an Objective-C framework. Calling it from Rust requires
-`objc2` message sends and an active `NSRunLoop`. This is the hardest part
-of the Rust bridge. For a first version, the CGWindowList/CGDisplay legacy
-APIs above are sufficient and much simpler.
-
-If you need ScreenCaptureKit (better quality, no prompt badge):
-
-```rust
-// capture_sck.rs — ScreenCaptureKit via objc2
-//
-// This is a sketch. SCK requires:
-// 1. An async completion handler (block2 crate)
-// 2. A running NSRunLoop on the calling thread
-// 3. objc2-screen-capture-kit bindings (or hand-rolled)
-
-use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
-use objc2::{msg_send, msg_send_id, class};
-use block2::ConcreteBlock;
-
-/// Capture using SCScreenshotManager (macOS 14+).
-pub async fn capture_screen_sck() -> Result<Vec<u8>, CaptureError> {
-    // 1. Get shareable content
-    //    [SCShareableContent getShareableContentExcludingDesktopWindows:NO
-    //                                        onScreenWindowsOnly:YES
-    //                                        completionHandler:^(content, error) { ... }]
-    //
-    // 2. Create filter for the display
-    //    [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]]
-    //
-    // 3. Create configuration
-    //    SCStreamConfiguration *config = [[SCStreamConfiguration alloc] init];
-    //    config.width = display.width;
-    //    config.height = display.height;
-    //    config.showsCursor = NO;
-    //
-    // 4. Capture
-    //    [SCScreenshotManager captureImageWithFilter:filter
-    //                                configuration:config
-    //                            completionHandler:^(image, error) { ... }]
-    //
-    // The completion handlers need to be bridged to Rust futures
-    // using tokio::sync::oneshot channels inside block2 blocks.
-
-    todo!("SCK implementation requires objc2 + block2 + runloop")
-}
-```
-
-### 2.4 Application Management (apps.rs)
-
-```rust
-// apps.rs — NSWorkspace and NSRunningApplication via objc2
-use objc2_app_kit::{NSWorkspace, NSRunningApplication, NSApplicationActivationPolicy};
-use objc2_foundation::{NSString, NSArray};
-
-/// List all running GUI applications.
-pub fn list_applications() -> Vec<AppInfo> {
-    let workspace = unsafe { NSWorkspace::sharedWorkspace() };
-    let apps = unsafe { workspace.runningApplications() };
-    let mut result = Vec::new();
-
-    for i in 0..apps.len() {
-        let app: &NSRunningApplication = &apps[i];
-        let policy = unsafe { app.activationPolicy() };
-        // Skip background-only and prohibited apps
-        if policy != NSApplicationActivationPolicy::Regular {
-            continue;
-        }
-        result.push(AppInfo {
-            pid: unsafe { app.processIdentifier() },
-            bundle_id: unsafe { app.bundleIdentifier() }
-                .map(|s| s.to_string()),
-            name: unsafe { app.localizedName() }
-                .map(|s| s.to_string()),
-            is_active: unsafe { app.isActive() },
-            is_hidden: unsafe { app.isHidden() },
-        });
-    }
-    result
-}
-
-/// Get the frontmost application.
-pub fn frontmost_application() -> Option<AppInfo> {
-    let workspace = unsafe { NSWorkspace::sharedWorkspace() };
-    let app = unsafe { workspace.frontmostApplication()? };
-    Some(AppInfo {
-        pid: unsafe { app.processIdentifier() },
-        bundle_id: unsafe { app.bundleIdentifier() }.map(|s| s.to_string()),
-        name: unsafe { app.localizedName() }.map(|s| s.to_string()),
-        is_active: true,
-        is_hidden: false,
-    })
-}
-
-/// Activate (bring to front) an application by bundle ID.
-pub fn activate_app(bundle_id: &str) -> Result<(), AppError> {
-    let app = find_running_app(bundle_id)?;
-    unsafe { app.activateWithOptions(0x01) }; // NSApplicationActivateIgnoringOtherApps
-    Ok(())
-}
-
-/// Hide an application.
-pub fn hide_app(bundle_id: &str) -> Result<(), AppError> {
-    let app = find_running_app(bundle_id)?;
-    unsafe { app.hide() };
-    Ok(())
-}
-
-/// Quit an application (gracefully or force).
-pub fn quit_app(bundle_id: &str, force: bool) -> Result<bool, AppError> {
-    let app = find_running_app(bundle_id)?;
-    let result = if force {
-        unsafe { app.forceTerminate() }
-    } else {
-        unsafe { app.terminate() }
-    };
-    Ok(result)
-}
-
-/// Launch an application by bundle ID.
-pub fn launch_app(bundle_id: &str) -> Result<(), AppError> {
-    let workspace = unsafe { NSWorkspace::sharedWorkspace() };
-    let ns_bundle_id = NSString::from_str(bundle_id);
-    let url = unsafe { workspace.URLForApplicationWithBundleIdentifier(&ns_bundle_id) }
-        .ok_or(AppError::NotFound(bundle_id.to_string()))?;
-
-    let config = unsafe { objc2_app_kit::NSWorkspaceOpenConfiguration::new() };
-    // Launch is async with completion handler; for simplicity, fire-and-forget
+/// Free a buffer previously returned by a mac_* function.
+#[unsafe(no_mangle)]
+pub extern "C" fn mac_free_buffer(ptr: *mut u8, len: u64) {
+    if ptr.is_null() { return; }
     unsafe {
-        workspace.openApplicationAtURL_configuration_completionHandler(
-            &url, &config, None,
-        );
+        let _ = Vec::from_raw_parts(ptr, len as usize, len as usize);
+        // Vec drops, memory freed
     }
-    Ok(())
 }
 
-fn find_running_app(bundle_id: &str) -> Result<Retained<NSRunningApplication>, AppError> {
-    let workspace = unsafe { NSWorkspace::sharedWorkspace() };
-    let apps = unsafe { workspace.runningApplications() };
-    for i in 0..apps.len() {
-        let app: &NSRunningApplication = &apps[i];
-        if let Some(bid) = unsafe { app.bundleIdentifier() } {
-            if bid.to_string() == bundle_id {
-                return Ok(app.retain());
-            }
+/// Helper: box a Vec<u8> into a pointer+length pair.
+/// Writes length to *out_len, returns pointer.
+fn vec_to_ffi(data: Vec<u8>, out_len: *mut u64) -> *mut u8 {
+    let len = data.len();
+    let ptr = data.leak().as_mut_ptr();
+    if !out_len.is_null() {
+        unsafe { *out_len = len as u64; }
+    }
+    ptr
+}
+
+/// Helper: box a JSON-serializable value into a C string pointer.
+fn json_to_ffi<T: serde::Serialize>(value: &T, out_len: *mut u64) -> *mut u8 {
+    match serde_json::to_vec(value) {
+        Ok(bytes) => vec_to_ffi(bytes, out_len),
+        Err(_) => {
+            if !out_len.is_null() { unsafe { *out_len = 0; } }
+            ptr::null_mut()
         }
     }
-    Err(AppError::NotFound(bundle_id.to_string()))
 }
 
-#[derive(Debug, serde::Serialize)]
-pub struct AppInfo {
-    pub pid: i32,
-    pub bundle_id: Option<String>,
-    pub name: Option<String>,
-    pub is_active: bool,
-    pub is_hidden: bool,
+/// Helper: read a C string pointer from Deno's buffer type.
+unsafe fn cstr_from_ptr(ptr: *const u8, len: u32) -> &'static str {
+    if ptr.is_null() || len == 0 { return ""; }
+    let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    std::str::from_utf8(slice).unwrap_or("")
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum AppError {
-    #[error("application not found: {0}")]
-    NotFound(String),
-}
-```
+// =================================================================
+// Permissions
+// =================================================================
 
-### 2.5 Clipboard (clipboard.rs)
-
-```rust
-// clipboard.rs
-use objc2_app_kit::NSPasteboard;
-use objc2_foundation::NSString;
-
-pub fn read_clipboard() -> Option<String> {
-    let pb = unsafe { NSPasteboard::generalPasteboard() };
-    let ns_type = unsafe { NSString::from_str("public.utf8-plain-text") };
-    unsafe { pb.stringForType(&ns_type) }.map(|s| s.to_string())
+/// Check TCC permissions. Returns JSON: {"accessibility":bool,"screenRecording":bool}
+#[unsafe(no_mangle)]
+pub extern "C" fn mac_check_permissions(out_len: *mut u64) -> *mut u8 {
+    let status = crate::permissions::check_permissions();
+    json_to_ffi(&status, out_len)
 }
 
-pub fn write_clipboard(text: &str) {
-    let pb = unsafe { NSPasteboard::generalPasteboard() };
-    unsafe { pb.clearContents() };
-    let ns_string = NSString::from_str(text);
-    let ns_type = unsafe { NSString::from_str("public.utf8-plain-text") };
-    unsafe { pb.setString_forType(&ns_string, &ns_type) };
-}
-```
-
-### 2.6 Permissions (permissions.rs)
-
-```rust
-// permissions.rs
-use core_graphics::display::CGPreflightScreenCaptureAccess;
-
-pub struct PermissionsStatus {
-    pub accessibility: bool,
-    pub screen_recording: bool,
+/// Returns 1 if accessibility is trusted, 0 otherwise.
+#[unsafe(no_mangle)]
+pub extern "C" fn mac_is_accessibility_trusted() -> u8 {
+    crate::ax::is_trusted() as u8
 }
 
-pub fn check_permissions() -> PermissionsStatus {
-    PermissionsStatus {
-        accessibility: super::ax::is_trusted(),
-        screen_recording: unsafe { CGPreflightScreenCaptureAccess() },
+// =================================================================
+// Input — mouse, keyboard, scroll
+// =================================================================
+
+/// Click at (x, y). button: 0=left, 1=right. Returns 0 on success.
+#[unsafe(no_mangle)]
+pub extern "C" fn mac_click(x: f64, y: f64, button: u8, count: u32) -> i32 {
+    let btn = if button == 1 {
+        crate::input::MouseButton::Right
+    } else {
+        crate::input::MouseButton::Left
+    };
+    match crate::input::click(x, y, btn, count) {
+        Ok(()) => 0,
+        Err(_) => -1,
     }
 }
 
-pub fn request_screen_recording() -> bool {
-    unsafe { core_graphics::display::CGRequestScreenCaptureAccess() }
-}
-```
-
----
-
-## Part 3: napi-rs Binding Layer
-
-The napi layer is thin — it just exposes `mac-bridge-core` functions to Node.js.
-
-```rust
-// mac-bridge-napi/src/lib.rs
-use napi_derive::napi;
-use mac_bridge_core::{input, ax, capture, apps, clipboard, permissions};
-
-// --- Input ---
-
-#[napi]
-pub fn mouse_move(x: f64, y: f64) -> napi::Result<()> {
-    input::mouse_move(x, y).map_err(|e| napi::Error::from_reason(e.to_string()))
+/// Move mouse to (x, y). Returns 0 on success.
+#[unsafe(no_mangle)]
+pub extern "C" fn mac_mouse_move(x: f64, y: f64) -> i32 {
+    match crate::input::mouse_move(x, y) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
 }
 
-#[napi]
-pub fn click(x: f64, y: f64, button: String, count: u32) -> napi::Result<()> {
-    let btn = match button.as_str() {
-        "right" => input::MouseButton::Right,
-        _ => input::MouseButton::Left,
-    };
-    input::click(x, y, btn, count).map_err(|e| napi::Error::from_reason(e.to_string()))
+/// Press a hotkey combination. `keys` is a UTF-8 buffer like "cmd+shift+s".
+/// `keys_len` is the byte length. Returns 0 on success.
+#[unsafe(no_mangle)]
+pub extern "C" fn mac_hotkey(
+    keys: *const u8, keys_len: u32,
+    hold_duration_ms: u64,
+) -> i32 {
+    let keys_str = unsafe { cstr_from_ptr(keys, keys_len) };
+    match crate::input::hotkey(keys_str, hold_duration_ms) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
 }
 
-#[napi]
-pub fn hotkey(keys: String, hold_duration_ms: u32) -> napi::Result<()> {
-    input::hotkey(&keys, hold_duration_ms as u64)
-        .map_err(|e| napi::Error::from_reason(e.to_string()))
+/// Type text character by character. `text` is UTF-8 buffer.
+/// Returns 0 on success.
+#[unsafe(no_mangle)]
+pub extern "C" fn mac_type_text(
+    text: *const u8, text_len: u32,
+    delay_ms: u64,
+) -> i32 {
+    let text_str = unsafe { cstr_from_ptr(text, text_len) };
+    match crate::input::type_text(text_str, delay_ms) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
 }
 
-#[napi]
-pub fn type_text(text: String, delay_ms: u32) -> napi::Result<()> {
-    input::type_text(&text, delay_ms as u64)
-        .map_err(|e| napi::Error::from_reason(e.to_string()))
+/// Scroll. delta_y positive = scroll up, negative = scroll down.
+/// Returns 0 on success.
+#[unsafe(no_mangle)]
+pub extern "C" fn mac_scroll(delta_x: i32, delta_y: i32) -> i32 {
+    match crate::input::scroll(delta_x, delta_y) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
 }
 
-#[napi]
-pub fn scroll(delta_x: i32, delta_y: i32) -> napi::Result<()> {
-    input::scroll(delta_x, delta_y)
-        .map_err(|e| napi::Error::from_reason(e.to_string()))
-}
-
-#[napi]
-pub fn drag(
+/// Drag from (x0,y0) to (x1,y1) with interpolation steps.
+/// Returns 0 on success.
+#[unsafe(no_mangle)]
+pub extern "C" fn mac_drag(
     from_x: f64, from_y: f64,
     to_x: f64, to_y: f64,
-    steps: u32, step_delay_ms: u32,
-) -> napi::Result<()> {
-    input::drag(from_x, from_y, to_x, to_y, steps, step_delay_ms as u64)
-        .map_err(|e| napi::Error::from_reason(e.to_string()))
+    steps: u32, step_delay_ms: u64,
+) -> i32 {
+    match crate::input::drag(from_x, from_y, to_x, to_y, steps, step_delay_ms) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
 }
 
-// --- Accessibility ---
+// =================================================================
+// Screen Capture
+// =================================================================
 
-#[napi]
-pub fn is_accessibility_trusted() -> bool {
-    ax::is_trusted()
-}
-
-#[napi(object)]
-pub struct ElementInfo {
-    pub role: Option<String>,
-    pub title: Option<String>,
-    pub label: Option<String>,
-    pub value: Option<String>,
-    pub x: f64,
-    pub y: f64,
-    pub width: f64,
-    pub height: f64,
-}
-
-#[napi]
-pub fn get_focused_element() -> napi::Result<Option<ElementInfo>> {
-    let sys = ax::system_wide();
-    let focused = match sys.string_attr("AXFocusedUIElement") {
-        Some(_) => {
-            // Actually need to get the element ref, not string.
-            // Simplified: get frontmost app, then focused element.
-            None
+/// Capture the main display as PNG. Returns pointer to PNG bytes.
+/// Writes byte count to *out_len. Caller must call mac_free_buffer.
+#[unsafe(no_mangle)]
+pub extern "C" fn mac_capture_screen(display_id: u32, out_len: *mut u64) -> *mut u8 {
+    match crate::capture::capture_display(display_id) {
+        Ok(png_bytes) => vec_to_ffi(png_bytes, out_len),
+        Err(_) => {
+            if !out_len.is_null() { unsafe { *out_len = 0; } }
+            ptr::null_mut()
         }
-        None => None,
-    };
-    Ok(focused)
+    }
 }
 
-#[napi]
-pub fn get_app_windows(pid: i32) -> Vec<ElementInfo> {
-    let app = ax::application(pid);
+/// Capture a specific window by CGWindowID. Returns PNG bytes pointer.
+/// Caller must call mac_free_buffer.
+#[unsafe(no_mangle)]
+pub extern "C" fn mac_capture_window(window_id: u32, out_len: *mut u64) -> *mut u8 {
+    match crate::capture::capture_window(window_id) {
+        Ok(png_bytes) => vec_to_ffi(png_bytes, out_len),
+        Err(_) => {
+            if !out_len.is_null() { unsafe { *out_len = 0; } }
+            ptr::null_mut()
+        }
+    }
+}
+
+// =================================================================
+// Applications
+// =================================================================
+
+/// List running GUI applications. Returns JSON array pointer.
+/// Caller must call mac_free_buffer.
+#[unsafe(no_mangle)]
+pub extern "C" fn mac_list_applications(out_len: *mut u64) -> *mut u8 {
+    let apps = crate::apps::list_applications();
+    json_to_ffi(&apps, out_len)
+}
+
+/// Get the frontmost application. Returns JSON pointer.
+/// Caller must call mac_free_buffer.
+#[unsafe(no_mangle)]
+pub extern "C" fn mac_frontmost_application(out_len: *mut u64) -> *mut u8 {
+    match crate::apps::frontmost_application() {
+        Some(app) => json_to_ffi(&app, out_len),
+        None => {
+            if !out_len.is_null() { unsafe { *out_len = 0; } }
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Activate an application by bundle ID. Returns 0 on success.
+#[unsafe(no_mangle)]
+pub extern "C" fn mac_activate_app(
+    bundle_id: *const u8, bundle_id_len: u32,
+) -> i32 {
+    let id = unsafe { cstr_from_ptr(bundle_id, bundle_id_len) };
+    match crate::apps::activate_app(id) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// Launch an application by bundle ID. Returns 0 on success.
+#[unsafe(no_mangle)]
+pub extern "C" fn mac_launch_app(
+    bundle_id: *const u8, bundle_id_len: u32,
+) -> i32 {
+    let id = unsafe { cstr_from_ptr(bundle_id, bundle_id_len) };
+    match crate::apps::launch_app(id) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// Quit an application. force: 0=graceful, 1=force. Returns 0 on success.
+#[unsafe(no_mangle)]
+pub extern "C" fn mac_quit_app(
+    bundle_id: *const u8, bundle_id_len: u32,
+    force: u8,
+) -> i32 {
+    let id = unsafe { cstr_from_ptr(bundle_id, bundle_id_len) };
+    match crate::apps::quit_app(id, force != 0) {
+        Ok(_) => 0,
+        Err(_) => -1,
+    }
+}
+
+// =================================================================
+// Clipboard
+// =================================================================
+
+/// Read clipboard text. Returns UTF-8 pointer.
+/// Caller must call mac_free_buffer.
+#[unsafe(no_mangle)]
+pub extern "C" fn mac_read_clipboard(out_len: *mut u64) -> *mut u8 {
+    match crate::clipboard::read_clipboard() {
+        Some(text) => {
+            let bytes = text.into_bytes();
+            vec_to_ffi(bytes, out_len)
+        }
+        None => {
+            if !out_len.is_null() { unsafe { *out_len = 0; } }
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Write text to clipboard. Returns 0 on success.
+#[unsafe(no_mangle)]
+pub extern "C" fn mac_write_clipboard(
+    text: *const u8, text_len: u32,
+) -> i32 {
+    let text_str = unsafe { cstr_from_ptr(text, text_len) };
+    crate::clipboard::write_clipboard(text_str);
+    0
+}
+
+// =================================================================
+// Accessibility — element queries
+// =================================================================
+
+/// Get AX windows for a PID. Returns JSON array pointer.
+/// Caller must call mac_free_buffer.
+#[unsafe(no_mangle)]
+pub extern "C" fn mac_get_windows(pid: i32, out_len: *mut u64) -> *mut u8 {
+    let app = crate::ax::application(pid);
     app.set_timeout(10.0);
-    app.windows().iter().map(|w| {
+    let windows: Vec<serde_json::Value> = app.windows().iter().map(|w| {
         let (x, y, width, height) = w.frame().unwrap_or((0.0, 0.0, 0.0, 0.0));
-        ElementInfo {
-            role: w.role(),
-            title: w.title(),
-            label: w.label(),
-            value: None,
-            x, y, width, height,
-        }
-    }).collect()
+        serde_json::json!({
+            "role": w.role(),
+            "title": w.title(),
+            "label": w.label(),
+            "value": w.value(),
+            "x": x, "y": y, "width": width, "height": height,
+        })
+    }).collect();
+    json_to_ffi(&windows, out_len)
 }
 
-// --- Capture ---
+/// Find all AX elements matching a role under the frontmost app.
+/// Returns JSON array pointer. Caller must call mac_free_buffer.
+#[unsafe(no_mangle)]
+pub extern "C" fn mac_find_elements_by_role(
+    pid: i32,
+    role: *const u8, role_len: u32,
+    max_depth: u32,
+    out_len: *mut u64,
+) -> *mut u8 {
+    let role_str = unsafe { cstr_from_ptr(role, role_len) };
+    let app = crate::ax::application(pid);
+    app.set_timeout(10.0);
 
-#[napi]
-pub fn capture_screen(display_id: Option<u32>) -> napi::Result<napi::bindgen_prelude::Buffer> {
-    let id = display_id.unwrap_or_else(|| {
-        core_graphics::display::CGDisplay::main().id
+    let matches = app.find_all(max_depth as usize, &|elem| {
+        elem.role().as_deref() == Some(role_str)
     });
-    let png_bytes = capture::capture_display(id)
-        .map_err(|e| napi::Error::from_reason(e.to_string()))?;
-    Ok(png_bytes.into())
+
+    let elements: Vec<serde_json::Value> = matches.iter().map(|e| {
+        let (x, y, w, h) = e.frame().unwrap_or((0.0, 0.0, 0.0, 0.0));
+        serde_json::json!({
+            "role": e.role(),
+            "title": e.title(),
+            "label": e.label(),
+            "value": e.value(),
+            "x": x, "y": y, "width": w, "height": h,
+        })
+    }).collect();
+    json_to_ffi(&elements, out_len)
 }
 
-#[napi]
-pub fn capture_window(window_id: u32) -> napi::Result<napi::bindgen_prelude::Buffer> {
-    let png_bytes = capture::capture_window(window_id)
-        .map_err(|e| napi::Error::from_reason(e.to_string()))?;
-    Ok(png_bytes.into())
+/// Get the element at screen coordinates. Returns JSON pointer.
+/// Caller must call mac_free_buffer.
+#[unsafe(no_mangle)]
+pub extern "C" fn mac_element_at_position(
+    pid: i32, x: f32, y: f32,
+    out_len: *mut u64,
+) -> *mut u8 {
+    let app = crate::ax::application(pid);
+    match app.element_at_position(x, y) {
+        Some(elem) => {
+            let (ex, ey, ew, eh) = elem.frame().unwrap_or((0.0, 0.0, 0.0, 0.0));
+            let value = serde_json::json!({
+                "role": elem.role(),
+                "title": elem.title(),
+                "label": elem.label(),
+                "value": elem.value(),
+                "x": ex, "y": ey, "width": ew, "height": eh,
+            });
+            json_to_ffi(&value, out_len)
+        }
+        None => {
+            if !out_len.is_null() { unsafe { *out_len = 0; } }
+            ptr::null_mut()
+        }
+    }
 }
 
-// --- Apps ---
-
-#[napi(object)]
-pub struct AppInfoJs {
-    pub pid: i32,
-    pub bundle_id: Option<String>,
-    pub name: Option<String>,
-    pub is_active: bool,
-    pub is_hidden: bool,
-}
-
-#[napi]
-pub fn list_applications() -> Vec<AppInfoJs> {
-    apps::list_applications().into_iter().map(|a| AppInfoJs {
-        pid: a.pid,
-        bundle_id: a.bundle_id,
-        name: a.name,
-        is_active: a.is_active,
-        is_hidden: a.is_hidden,
-    }).collect()
-}
-
-#[napi]
-pub fn activate_application(bundle_id: String) -> napi::Result<()> {
-    apps::activate_app(&bundle_id)
-        .map_err(|e| napi::Error::from_reason(e.to_string()))
-}
-
-#[napi]
-pub fn launch_application(bundle_id: String) -> napi::Result<()> {
-    apps::launch_app(&bundle_id)
-        .map_err(|e| napi::Error::from_reason(e.to_string()))
-}
-
-#[napi]
-pub fn quit_application(bundle_id: String, force: bool) -> napi::Result<bool> {
-    apps::quit_app(&bundle_id, force)
-        .map_err(|e| napi::Error::from_reason(e.to_string()))
-}
-
-// --- Clipboard ---
-
-#[napi]
-pub fn read_clipboard() -> Option<String> {
-    clipboard::read_clipboard()
-}
-
-#[napi]
-pub fn write_clipboard(text: String) {
-    clipboard::write_clipboard(&text);
-}
-
-// --- Permissions ---
-
-#[napi(object)]
-pub struct PermissionsStatusJs {
-    pub accessibility: bool,
-    pub screen_recording: bool,
-}
-
-#[napi]
-pub fn check_permissions() -> PermissionsStatusJs {
-    let status = permissions::check_permissions();
-    PermissionsStatusJs {
-        accessibility: status.accessibility,
-        screen_recording: status.screen_recording,
+/// Perform an AX action on the element at (x, y) for a given app.
+/// action is UTF-8 buffer (e.g. "AXPress"). Returns 0 on success.
+#[unsafe(no_mangle)]
+pub extern "C" fn mac_perform_action_at(
+    pid: i32, x: f32, y: f32,
+    action: *const u8, action_len: u32,
+) -> i32 {
+    let action_str = unsafe { cstr_from_ptr(action, action_len) };
+    let app = crate::ax::application(pid);
+    match app.element_at_position(x, y) {
+        Some(elem) => match elem.perform_action(action_str) {
+            Ok(()) => 0,
+            Err(_) => -1,
+        },
+        None => -1,
     }
 }
 ```
 
 ---
 
-## Part 4: TypeScript Client
+## Part 3: Rust Core Modules
+
+The core modules (input.rs, ax.rs, capture.rs, apps.rs, clipboard.rs,
+permissions.rs) are **unchanged from the previous document**. They use the
+same macOS APIs:
+
+- **input.rs** — `CGEventCreateMouseEvent`, `CGEventCreateKeyboardEvent`,
+  `CGEventCreateScrollWheelEvent`, `CGEventPost` via the `core-graphics` crate
+- **ax.rs** — `AXUIElementCreateApplication`, `AXUIElementCopyAttributeValue`,
+  `AXUIElementPerformAction`, `AXValueCreate` via raw FFI declarations
+- **capture.rs** — `CGDisplay::image()`, `CGWindowListCreateImage` via the
+  `core-graphics` crate (ScreenCaptureKit via `objc2` later)
+- **apps.rs** — `NSWorkspace`, `NSRunningApplication` via `objc2-app-kit`
+- **clipboard.rs** — `NSPasteboard` via `objc2-app-kit`
+- **permissions.rs** — `CGPreflightScreenCaptureAccess`, `AXIsProcessTrusted`
+
+The only difference is that the napi binding layer is gone. Instead, `ffi.rs`
+provides the `extern "C"` surface that `Deno.dlopen` calls.
+
+See the appendix at the end of this document for the full source of each
+core module, which is identical to the previous revision.
+
+---
+
+## Part 4: Deno FFI Client
+
+### deno/mod.ts — Symbol Definitions and dlopen
 
 ```typescript
-// ts/mac-bridge.ts
-import {
-  mouseMove, click, hotkey, typeText, scroll, drag,
-  isAccessibilityTrusted, getAppWindows,
-  captureScreen, captureWindow,
-  listApplications, activateApplication, launchApplication, quitApplication,
-  readClipboard, writeClipboard,
-  checkPermissions,
-  type ElementInfo, type AppInfoJs, type PermissionsStatusJs,
-} from '../index.js'; // napi-generated bindings
+// mod.ts — Load the Rust dylib and define all symbols
 
-// Re-export raw bindings for direct use
-export {
-  mouseMove, click, hotkey, typeText, scroll, drag,
-  readClipboard, writeClipboard,
-  checkPermissions,
-};
+const LIB_PATH = new URL(
+  "../target/release/libmacbridge.dylib",
+  import.meta.url,
+);
 
-// --- Higher-level typed wrappers ---
+const lib = Deno.dlopen(LIB_PATH, {
+  // --- Buffer management ---
+  mac_free_buffer: {
+    parameters: ["pointer", "u64"],
+    result: "void",
+  },
 
-export type ClickButton = 'left' | 'right';
+  // --- Permissions ---
+  mac_check_permissions: {
+    parameters: ["pointer"],  // out_len: *mut u64
+    result: "pointer",
+  },
+  mac_is_accessibility_trusted: {
+    parameters: [],
+    result: "u8",
+  },
 
-export interface Point { x: number; y: number; }
-export interface Rect { x: number; y: number; width: number; height: number; }
+  // --- Input ---
+  mac_click: {
+    parameters: ["f64", "f64", "u8", "u32"],
+    result: "i32",
+  },
+  mac_mouse_move: {
+    parameters: ["f64", "f64"],
+    result: "i32",
+  },
+  mac_hotkey: {
+    parameters: ["buffer", "u32", "u64"],
+    result: "i32",
+  },
+  mac_type_text: {
+    parameters: ["buffer", "u32", "u64"],
+    result: "i32",
+  },
+  mac_scroll: {
+    parameters: ["i32", "i32"],
+    result: "i32",
+  },
+  mac_drag: {
+    parameters: ["f64", "f64", "f64", "f64", "u32", "u64"],
+    result: "i32",
+  },
+
+  // --- Capture ---
+  mac_capture_screen: {
+    parameters: ["u32", "pointer"],  // display_id, out_len
+    result: "pointer",
+  },
+  mac_capture_window: {
+    parameters: ["u32", "pointer"],  // window_id, out_len
+    result: "pointer",
+  },
+
+  // --- Applications ---
+  mac_list_applications: {
+    parameters: ["pointer"],  // out_len
+    result: "pointer",
+  },
+  mac_frontmost_application: {
+    parameters: ["pointer"],  // out_len
+    result: "pointer",
+  },
+  mac_activate_app: {
+    parameters: ["buffer", "u32"],
+    result: "i32",
+  },
+  mac_launch_app: {
+    parameters: ["buffer", "u32"],
+    result: "i32",
+  },
+  mac_quit_app: {
+    parameters: ["buffer", "u32", "u8"],
+    result: "i32",
+  },
+
+  // --- Clipboard ---
+  mac_read_clipboard: {
+    parameters: ["pointer"],  // out_len
+    result: "pointer",
+  },
+  mac_write_clipboard: {
+    parameters: ["buffer", "u32"],
+    result: "i32",
+  },
+
+  // --- Accessibility ---
+  mac_get_windows: {
+    parameters: ["i32", "pointer"],  // pid, out_len
+    result: "pointer",
+  },
+  mac_find_elements_by_role: {
+    parameters: ["i32", "buffer", "u32", "u32", "pointer"],
+    result: "pointer",
+  },
+  mac_element_at_position: {
+    parameters: ["i32", "f32", "f32", "pointer"],
+    result: "pointer",
+  },
+  mac_perform_action_at: {
+    parameters: ["i32", "f32", "f32", "buffer", "u32"],
+    result: "i32",
+  },
+});
+
+export default lib;
+export const symbols = lib.symbols;
+```
+
+### deno/ffi_helpers.ts — Pointer/Buffer Utilities
+
+```typescript
+// ffi_helpers.ts — helpers for reading Rust-allocated data from Deno
+
+import lib from "./mod.ts";
+
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
+/**
+ * Encode a string to a Uint8Array for passing as FFI "buffer" parameter.
+ * Returns [buffer, length] for the two-arg pattern.
+ */
+export function encodeStr(s: string): [Uint8Array, number] {
+  const buf = encoder.encode(s);
+  return [buf, buf.byteLength];
+}
+
+/**
+ * Allocate a u64 out-parameter for Rust to write a length into.
+ * Returns [BigUint64Array, pointer-to-it].
+ */
+export function outLen(): [BigUint64Array, Deno.PointerValue] {
+  const buf = new BigUint64Array(1);
+  return [buf, Deno.UnsafePointer.of(buf)!];
+}
+
+/**
+ * Read bytes from a Rust-allocated pointer, then free the Rust buffer.
+ * Returns a Uint8Array copy owned by JS.
+ */
+export function readAndFreeBuffer(
+  ptr: Deno.PointerValue,
+  lenBuf: BigUint64Array,
+): Uint8Array | null {
+  if (ptr === null) return null;
+  const len = Number(lenBuf[0]);
+  if (len === 0) return null;
+
+  const view = new Deno.UnsafePointerView(ptr);
+  const copy = new Uint8Array(len);
+  view.copyInto(copy);
+
+  // Free the Rust allocation
+  lib.symbols.mac_free_buffer(ptr, lenBuf[0]);
+
+  return copy;
+}
+
+/**
+ * Call a Rust function that returns JSON via pointer+length.
+ * Parses and returns the typed result.
+ */
+export function callJson<T>(
+  fn: (outLenPtr: Deno.PointerValue) => Deno.PointerValue,
+): T | null {
+  const [lenBuf, lenPtr] = outLen();
+  const ptr = fn(lenPtr);
+  const bytes = readAndFreeBuffer(ptr, lenBuf);
+  if (!bytes) return null;
+  return JSON.parse(decoder.decode(bytes)) as T;
+}
+
+/**
+ * Call a Rust function that returns raw bytes via pointer+length.
+ * Returns the bytes as a Uint8Array.
+ */
+export function callBytes(
+  fn: (outLenPtr: Deno.PointerValue) => Deno.PointerValue,
+): Uint8Array | null {
+  const [lenBuf, lenPtr] = outLen();
+  const ptr = fn(lenPtr);
+  return readAndFreeBuffer(ptr, lenBuf);
+}
+
+/**
+ * Assert a C function returned 0 (success).
+ */
+export function assertOk(result: number, op: string): void {
+  if (result !== 0) {
+    throw new Error(`${op} failed (error code: ${result})`);
+  }
+}
+```
+
+### deno/mac_bridge.ts — High-Level Typed API
+
+```typescript
+// mac_bridge.ts — typed wrappers for the Deno FFI bridge
+
+import { symbols } from "./mod.ts";
+import { encodeStr, callJson, callBytes, assertOk } from "./ffi_helpers.ts";
+
+// ---- Types ----
+
+export interface Point { x: number; y: number }
+export interface Rect  { x: number; y: number; width: number; height: number }
 
 export interface AppInfo {
   pid: number;
-  bundleId: string | null;
+  bundle_id: string | null;
   name: string | null;
-  isActive: boolean;
-  isHidden: boolean;
+  is_active: boolean;
+  is_hidden: boolean;
 }
 
-export interface WindowInfo {
+export interface ElementInfo {
   role: string | null;
   title: string | null;
   label: string | null;
-  bounds: Rect;
+  value: string | null;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
 }
 
 export interface Permissions {
   accessibility: boolean;
-  screenRecording: boolean;
+  screen_recording: boolean;
 }
 
-// --- Input ---
+// ---- Permissions ----
 
-export async function clickAt(
+export function checkPermissions(): Permissions {
+  return callJson<Permissions>((outLen) =>
+    symbols.mac_check_permissions(outLen)
+  )!;
+}
+
+export function isAccessibilityTrusted(): boolean {
+  return symbols.mac_is_accessibility_trusted() !== 0;
+}
+
+// ---- Input ----
+
+export function click(
   point: Point,
-  button: ClickButton = 'left',
+  button: "left" | "right" = "left",
   count = 1,
-): Promise<void> {
-  click(point.x, point.y, button, count);
+): void {
+  const btn = button === "right" ? 1 : 0;
+  assertOk(symbols.mac_click(point.x, point.y, btn, count), "click");
 }
 
-export async function doubleClick(point: Point): Promise<void> {
-  click(point.x, point.y, 'left', 2);
+export function doubleClick(point: Point): void {
+  click(point, "left", 2);
 }
 
-export async function rightClick(point: Point): Promise<void> {
-  click(point.x, point.y, 'right', 1);
+export function rightClick(point: Point): void {
+  click(point, "right", 1);
 }
 
-export async function moveMouse(point: Point): Promise<void> {
-  mouseMove(point.x, point.y);
+export function mouseMove(point: Point): void {
+  assertOk(symbols.mac_mouse_move(point.x, point.y), "mouseMove");
 }
 
-export async function pressHotkey(keys: string): Promise<void> {
-  hotkey(keys, 0);
+export function hotkey(keys: string, holdDurationMs = 0): void {
+  const [buf, len] = encodeStr(keys);
+  assertOk(
+    symbols.mac_hotkey(buf, len, BigInt(holdDurationMs)),
+    "hotkey",
+  );
 }
 
-export async function type(text: string, delayMs = 50): Promise<void> {
-  typeText(text, delayMs);
+export function typeText(text: string, delayMs = 50): void {
+  const [buf, len] = encodeStr(text);
+  assertOk(
+    symbols.mac_type_text(buf, len, BigInt(delayMs)),
+    "typeText",
+  );
 }
 
-export async function scrollDown(amount = 3): Promise<void> {
+export function scroll(deltaX: number, deltaY: number): void {
+  assertOk(symbols.mac_scroll(deltaX, deltaY), "scroll");
+}
+
+export function scrollDown(amount = 3): void {
   scroll(0, -amount);
 }
 
-export async function scrollUp(amount = 3): Promise<void> {
+export function scrollUp(amount = 3): void {
   scroll(0, amount);
 }
 
-export async function dragFromTo(
-  from: Point, to: Point,
-  steps = 20, stepDelayMs = 10,
-): Promise<void> {
-  drag(from.x, from.y, to.x, to.y, steps, stepDelayMs);
+export function drag(
+  from: Point,
+  to: Point,
+  steps = 20,
+  stepDelayMs = 10,
+): void {
+  assertOk(
+    symbols.mac_drag(
+      from.x, from.y, to.x, to.y, steps, BigInt(stepDelayMs),
+    ),
+    "drag",
+  );
 }
 
-// --- Screen Capture ---
+// ---- Screen Capture ----
 
-export async function captureMainDisplay(): Promise<Buffer> {
-  return captureScreen(null);
+/** Capture the main display. Returns PNG bytes. */
+export function captureScreen(displayId = 0): Uint8Array {
+  const data = callBytes((outLen) =>
+    symbols.mac_capture_screen(displayId, outLen)
+  );
+  if (!data) throw new Error("Screen capture failed");
+  return data;
 }
 
-export async function captureWindowById(windowId: number): Promise<Buffer> {
-  return captureWindow(windowId);
+/** Capture a window by its CGWindowID. Returns PNG bytes. */
+export function captureWindow(windowId: number): Uint8Array {
+  const data = callBytes((outLen) =>
+    symbols.mac_capture_window(windowId, outLen)
+  );
+  if (!data) throw new Error("Window capture failed");
+  return data;
 }
 
-// --- Applications ---
+// ---- Applications ----
 
-export function getApplications(): AppInfo[] {
-  return listApplications().map(a => ({
-    pid: a.pid,
-    bundleId: a.bundleId,
-    name: a.name,
-    isActive: a.isActive,
-    isHidden: a.isHidden,
-  }));
+export function listApplications(): AppInfo[] {
+  return callJson<AppInfo[]>((outLen) =>
+    symbols.mac_list_applications(outLen)
+  ) ?? [];
 }
 
-export async function activateApp(bundleId: string): Promise<void> {
-  activateApplication(bundleId);
+export function frontmostApplication(): AppInfo | null {
+  return callJson<AppInfo>((outLen) =>
+    symbols.mac_frontmost_application(outLen)
+  );
 }
 
-export async function launchApp(bundleId: string): Promise<void> {
-  launchApplication(bundleId);
+export function activateApp(bundleId: string): void {
+  const [buf, len] = encodeStr(bundleId);
+  assertOk(symbols.mac_activate_app(buf, len), "activateApp");
 }
 
-export async function quitApp(bundleId: string, force = false): Promise<boolean> {
-  return quitApplication(bundleId, force);
+export function launchApp(bundleId: string): void {
+  const [buf, len] = encodeStr(bundleId);
+  assertOk(symbols.mac_launch_app(buf, len), "launchApp");
 }
 
-// --- Windows (via AX) ---
-
-export function getWindows(pid: number): WindowInfo[] {
-  return getAppWindows(pid).map(w => ({
-    role: w.role,
-    title: w.title,
-    label: w.label,
-    bounds: { x: w.x, y: w.y, width: w.width, height: w.height },
-  }));
+export function quitApp(bundleId: string, force = false): void {
+  const [buf, len] = encodeStr(bundleId);
+  assertOk(
+    symbols.mac_quit_app(buf, len, force ? 1 : 0),
+    "quitApp",
+  );
 }
 
-// --- Permissions ---
+// ---- Clipboard ----
 
-export function ensurePermissions(): Permissions {
-  const status = checkPermissions();
-  if (!status.accessibility) {
-    console.warn(
-      'Accessibility permission not granted. ' +
-      'Go to System Settings → Privacy & Security → Accessibility ' +
-      'and add this application.'
-    );
-  }
-  if (!status.screenRecording) {
-    console.warn(
-      'Screen Recording permission not granted. ' +
-      'Go to System Settings → Privacy & Security → Screen Recording ' +
-      'and add this application.'
-    );
-  }
-  return status;
+export function readClipboard(): string | null {
+  const data = callBytes((outLen) => symbols.mac_read_clipboard(outLen));
+  if (!data) return null;
+  return new TextDecoder().decode(data);
+}
+
+export function writeClipboard(text: string): void {
+  const [buf, len] = encodeStr(text);
+  assertOk(symbols.mac_write_clipboard(buf, len), "writeClipboard");
+}
+
+// ---- Accessibility ----
+
+/** Get AX windows for a process. */
+export function getWindows(pid: number): ElementInfo[] {
+  return callJson<ElementInfo[]>((outLen) =>
+    symbols.mac_get_windows(pid, outLen)
+  ) ?? [];
+}
+
+/** Find all elements matching a role (e.g. "AXButton") in an app. */
+export function findElementsByRole(
+  pid: number,
+  role: string,
+  maxDepth = 10,
+): ElementInfo[] {
+  const [buf, len] = encodeStr(role);
+  return callJson<ElementInfo[]>((outLen) =>
+    symbols.mac_find_elements_by_role(pid, buf, len, maxDepth, outLen)
+  ) ?? [];
+}
+
+/** Get the AX element at a screen position. */
+export function elementAtPosition(
+  pid: number,
+  point: Point,
+): ElementInfo | null {
+  return callJson<ElementInfo>((outLen) =>
+    symbols.mac_element_at_position(pid, point.x, point.y, outLen)
+  );
+}
+
+/** Perform an AX action on the element at a screen position. */
+export function performActionAt(
+  pid: number,
+  point: Point,
+  action: string,
+): void {
+  const [buf, len] = encodeStr(action);
+  assertOk(
+    symbols.mac_perform_action_at(pid, point.x, point.y, buf, len),
+    "performActionAt",
+  );
+}
+
+// ---- Lifecycle ----
+
+/** Close the dylib. Call when done. */
+export function close(): void {
+  lib.close();
 }
 ```
 
@@ -1374,138 +1040,207 @@ export function ensurePermissions(): Permissions {
 ## Part 5: Agent Usage Example
 
 ```typescript
-// agent.ts — example OpenClaw-like agent loop
+// deno/agent.ts — example agent loop
+//
+// Run: deno run --allow-ffi --allow-write agent.ts
+
 import {
-  ensurePermissions, captureMainDisplay,
-  clickAt, type, pressHotkey, scrollDown,
-  getApplications, activateApp, getWindows,
-} from './mac-bridge.js';
-import { writeFileSync } from 'fs';
+  checkPermissions,
+  captureScreen,
+  click,
+  typeText,
+  hotkey,
+  scrollDown,
+  listApplications,
+  frontmostApplication,
+  activateApp,
+  getWindows,
+  findElementsByRole,
+  close,
+} from "./mac_bridge.ts";
 
 async function agentLoop() {
   // 1. Check permissions on startup
-  const perms = ensurePermissions();
-  if (!perms.accessibility || !perms.screenRecording) {
-    console.error('Missing required permissions. Exiting.');
-    process.exit(1);
+  const perms = checkPermissions();
+  console.log("Permissions:", perms);
+  if (!perms.accessibility || !perms.screen_recording) {
+    console.error("Missing required permissions. Grant them in System Settings.");
+    Deno.exit(1);
   }
 
-  // 2. Capture the screen
-  const screenshot = await captureMainDisplay();
-  writeFileSync('/tmp/screen.png', screenshot);
+  // 2. See what's running
+  const apps = listApplications();
+  console.log(`${apps.length} running apps`);
+  const front = frontmostApplication();
+  console.log("Frontmost:", front?.name);
 
-  // 3. Send to your LLM for analysis
-  // const actions = await llm.analyze(screenshot);
-  // Example: LLM says "click at (500, 300) then type hello"
+  // 3. Capture the screen
+  const screenshot = captureScreen();
+  await Deno.writeFile("/tmp/screen.png", screenshot);
+  console.log(`Screenshot: ${screenshot.byteLength} bytes → /tmp/screen.png`);
 
-  // 4. Execute actions
-  await clickAt({ x: 500, y: 300 });
-  await type('hello world');
-  await pressHotkey('return');
+  // 4. Find all buttons in the frontmost app
+  if (front) {
+    const buttons = findElementsByRole(front.pid, "AXButton", 8);
+    console.log(`Found ${buttons.length} buttons:`);
+    for (const btn of buttons.slice(0, 5)) {
+      console.log(`  "${btn.title ?? btn.label}" at (${btn.x}, ${btn.y})`);
+    }
+  }
 
-  // 5. Capture again to verify
-  const after = await captureMainDisplay();
-  writeFileSync('/tmp/screen_after.png', after);
+  // 5. Interact
+  // (Your LLM decides what to do based on the screenshot)
+  // click({ x: 500, y: 300 });
+  // typeText("hello world");
+  // hotkey("cmd+s");
+
+  // 6. Cleanup
+  close();
 }
 
-agentLoop().catch(console.error);
+agentLoop();
 ```
 
----
-
-## Part 6: Build and Package
-
-### package.json
+### deno.json
 
 ```json
 {
-  "name": "@anthropic/mac-bridge",
-  "version": "0.1.0",
-  "main": "index.js",
-  "types": "index.d.ts",
-  "napi": {
-    "name": "mac-bridge",
-    "triples": {
-      "defaults": false,
-      "additional": [
-        "aarch64-apple-darwin",
-        "x86_64-apple-darwin"
-      ]
-    }
+  "tasks": {
+    "build": "cargo build --release",
+    "agent": "deno run --allow-ffi --allow-write --allow-read deno/agent.ts",
+    "dev": "cargo build && deno run --allow-ffi --allow-write --allow-read deno/agent.ts"
   },
-  "scripts": {
-    "build": "napi build --platform --release",
-    "build:debug": "napi build --platform",
-    "prepublishOnly": "napi prepublish -t npm"
-  },
-  "devDependencies": {
-    "@napi-rs/cli": "^3.0.0"
+  "compilerOptions": {
+    "strict": true
   }
 }
 ```
 
-### Build
+### Build and Run
 
 ```bash
-# Install napi-rs CLI
-npm install -g @napi-rs/cli
+# Build the Rust dylib
+cargo build --release
+# Produces: target/release/libmacbridge.dylib
 
-# Build the native addon
-cd mac-bridge
-npm run build
+# Run the agent
+deno run --allow-ffi --allow-write --allow-read deno/agent.ts
 
-# This produces:
-#   mac-bridge.darwin-arm64.node   (for Apple Silicon)
-#   mac-bridge.darwin-x64.node     (for Intel)
-#   index.js                       (JS loader)
-#   index.d.ts                     (TypeScript types)
-```
-
-### Linking macOS Frameworks
-
-In `mac-bridge-core/build.rs`:
-
-```rust
-fn main() {
-    println!("cargo:rustc-link-lib=framework=ApplicationServices");
-    println!("cargo:rustc-link-lib=framework=CoreGraphics");
-    println!("cargo:rustc-link-lib=framework=AppKit");
-    println!("cargo:rustc-link-lib=framework=CoreFoundation");
-    // Only link ScreenCaptureKit if targeting macOS 13+
-    if std::env::var("MACOSX_DEPLOYMENT_TARGET")
-        .map(|v| v >= "13.0")
-        .unwrap_or(false)
-    {
-        println!("cargo:rustc-link-lib=framework=ScreenCaptureKit");
-    }
-}
+# Or use the task shortcut
+deno task agent
 ```
 
 ---
 
-## Comparison: This Approach vs. Peekaboo Bridge
+## Part 6: How Data Flows Across the FFI Boundary
 
-| Aspect | Peekaboo Bridge (existing) | Your Own Rust Bridge |
+### Simple calls (primitives only)
+
+```
+TS: click({ x: 500, y: 300 })
+  → mac_bridge.ts calls symbols.mac_click(500.0, 300.0, 0, 1)
+  → Deno passes f64, f64, u8, u32 directly to the C function
+  → Rust: mac_click(500.0, 300.0, 0, 1) → input::click() → CGEventPost
+  → Returns i32 (0 = success)
+  → TS: assertOk checks return code
+```
+
+No allocation, no serialization. A single function call through the C ABI.
+
+### String parameters
+
+```
+TS: hotkey("cmd+shift+s")
+  → encodeStr("cmd+shift+s") → [Uint8Array(11), 11]
+  → symbols.mac_hotkey(buffer, 11, 0n)
+  → Deno passes Uint8Array as "buffer" type (pointer to JS typed array)
+  → Rust: reads UTF-8 slice from pointer+length
+  → Returns i32
+```
+
+The `"buffer"` FFI type passes a `Uint8Array` as a pointer directly to Rust.
+No copy. The Rust side reads it as `*const u8` with a length parameter.
+
+### Complex returns (JSON via pointer)
+
+```
+TS: listApplications()
+  → callJson(outLen => symbols.mac_list_applications(outLen))
+  → Allocates BigUint64Array(1) for length out-param
+  → symbols.mac_list_applications(pointerToLenBuf)
+  → Rust: serializes Vec<AppInfo> to JSON bytes
+  → Leaks the Vec to get a stable pointer, writes length to out_len
+  → Returns *mut u8 pointer
+  → Deno: UnsafePointerView.copyInto(new Uint8Array(len))
+  → Deno: symbols.mac_free_buffer(ptr, len) to release Rust memory
+  → JSON.parse(decoder.decode(bytes)) → AppInfo[]
+```
+
+### Binary returns (PNG via pointer)
+
+```
+TS: captureScreen()
+  → callBytes(outLen => symbols.mac_capture_screen(0, outLen))
+  → Same pointer+length pattern as JSON
+  → Returns raw PNG bytes as Uint8Array
+  → No JSON parsing needed
+```
+
+---
+
+## Comparison: Deno FFI vs. Previous napi-rs Approach
+
+| Aspect | napi-rs (Node.js) | Deno.dlopen (Deno) |
 |---|---|---|
-| **Runtime dependency** | Peekaboo.app or daemon must run | None — self-contained |
-| **IPC overhead** | UNIX socket per call (~1-5ms) | Zero — in-process function call |
-| **TCC permissions** | Held by Peekaboo host | Held by your Node process |
-| **Auth complexity** | Code signing + TeamID checks | None needed |
-| **Language** | Swift + AXorcist | Rust + objc2/core-graphics |
-| **Build complexity** | Just npm install a client | Must compile Rust for macOS |
-| **API surface** | 60+ operations pre-built | Build what you need |
-| **ScreenCaptureKit** | Full async SCK support | CGWindowList initially; SCK requires ObjC bridging |
-| **AX tree walking** | AXorcist (mature, timeout-aware) | Hand-rolled AXUIElement FFI |
-| **Maintenance** | Peekaboo team maintains APIs | You maintain macOS API bindings |
+| **Runtime** | Node.js | Deno |
+| **Binding layer** | napi-rs crate + `@napi-rs/cli` | `extern "C"` + `#[no_mangle]` only |
+| **Build artifact** | `.node` addon file | `.dylib` shared library |
+| **Type generation** | Auto-generated by napi-rs | Manual symbol definitions in TS |
+| **String passing** | napi handles automatically | Manual encode → buffer + length |
+| **Complex returns** | napi handles serde objects | Manual JSON via pointer + free |
+| **Build tooling** | Needs `@napi-rs/cli`, `npm` | Just `cargo build` |
+| **Dependencies** | `napi`, `napi-derive` crates | Zero extra Rust dependencies |
+| **Runtime overhead** | napi V8 bridge layer | Direct C function call |
 
-### Recommendation for Incremental Build
+**Trade-off**: napi-rs gives you automatic type marshalling but ties you to
+Node.js and adds build complexity. Deno FFI is simpler on the Rust side
+(plain C exports) but requires manual pointer management on the TypeScript
+side. The `ffi_helpers.ts` module encapsulates that complexity.
 
-1. **Start with input.rs + capture.rs + apps.rs** — these give you mouse,
-   keyboard, screenshots, and app management with the simplest APIs.
-2. **Add ax.rs** when you need element-aware clicking (by role/title) instead
-   of coordinate-only clicking.
-3. **Skip ScreenCaptureKit initially** — CGWindowList works fine and avoids
-   the ObjC async bridging complexity. Add SCK later if you need the quality
-   improvement or to avoid the screen recording "badge" indicator.
-4. **Menu traversal** is the most complex part (deep AX tree walks with
-   timeouts). Defer it unless your agent specifically needs menu interaction.
+---
+
+## Incremental Build Order
+
+1. **Start with input.rs + ffi.rs + permissions.rs** — mouse, keyboard, scroll,
+   and permission checks. These are pure C-type calls with no pointer
+   management on the return side. You can validate the entire FFI pipeline.
+
+2. **Add capture.rs** — introduces the pointer+length return pattern for PNG
+   bytes. Tests the `callBytes` / `mac_free_buffer` round-trip.
+
+3. **Add apps.rs + clipboard.rs** — introduces JSON returns via pointer. Tests
+   the `callJson` / `mac_free_buffer` round-trip.
+
+4. **Add ax.rs** — the most complex module. Start with `mac_get_windows` and
+   `mac_element_at_position`, then add tree-walking search.
+
+5. **Defer ScreenCaptureKit** — CGWindowList legacy capture works fine. SCK
+   requires ObjC async bridging (`block2` + `NSRunLoop`) which is substantially
+   harder in Rust.
+
+6. **Defer menu traversal** — deep AX tree walks with timeout handling. Only
+   add if your agent needs to interact with menus.
+
+---
+
+## Appendix: Core Module Source
+
+The implementations of `input.rs`, `ax.rs`, `capture.rs`, `apps.rs`,
+`clipboard.rs`, and `permissions.rs` are identical to the previous document
+revision. They contain the actual macOS API calls (CGEvent, AXUIElement,
+CGWindowList, NSWorkspace, NSPasteboard, etc.) and are independent of the
+FFI binding mechanism. The only difference is that napi-rs wrappers are
+replaced by the `extern "C"` functions in `ffi.rs` above.
+
+See `docs/custom-rust-ts-mac-bridge.md` for the full source of each core
+module.
