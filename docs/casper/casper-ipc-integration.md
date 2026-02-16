@@ -1,14 +1,14 @@
 # Integrating with Peekaboo via IPC Bridge
 
-This document explains how to connect a non-Swift agent (e.g., a JavaScript client with Rust device bridges) to Peekaboo's Mac automation capabilities over IPC, without shelling out to the `peekaboo` CLI.
+This document explains how to connect an agent client (e.g., a TypeScript/JavaScript client with Rust device bridges) to Peekaboo's Mac automation capabilities over IPC, without shelling out to the `peekaboo` CLI. The client issues TS-based commands to interact with macOS through the Peekaboo service.
 
 ## Architecture Overview
 
 ```
 ┌─────────────────────────────────────┐
-│  Your Agent (JS + Rust)             │
+│  Agent Client (TS + Rust)           │
 │                                     │
-│  JS orchestrator                    │
+│  TS command layer                   │
 │    ↓                                │
 │  Rust bridge layer (napi-rs / FFI)  │
 │    ↓                                │
@@ -812,39 +812,36 @@ function getError(response) {
 }
 ```
 
-## Typical Agent Workflow
+## Agent Client Usage Example
 
-A typical automation loop for an OpenClaw-like agent:
+A typical sequence of commands issued by a TS agent client:
 
 ```javascript
-// 1. Handshake
+// 1. Handshake — establish connection with the Peekaboo service
 const hs = await handshake();
 const enabled = hs.handshake._0.enabledOperations;
 console.log("Enabled operations:", enabled);
 
-// 2. Capture the screen and detect elements
+// 2. Capture the screen
 const capture = await captureScreen();
 const imageData = capture.capture._0.imageData; // base64 PNG
 
-// 3. Send screenshot to your LLM for analysis
-// ... LLM returns: "click element B1" ...
-
-// 4. Click the element
+// 3. Click an element by ID
 const result = await clickElement("B1", snapshotId);
 
-// 5. Type into a field
+// 4. Type into a field
 await typeText("search query");
 
-// 6. Press Enter
+// 5. Press Enter
 await hotkey("return");
 
-// 7. Capture again to see the result
+// 6. Capture again to verify the result
 const after = await captureScreen();
 ```
 
 ## Alternative: MCP over stdio
 
-If your agent already speaks MCP (Model Context Protocol), you can skip the bridge entirely and spawn `peekaboo mcp` as a subprocess:
+If your client already speaks MCP (Model Context Protocol), you can skip the bridge entirely and spawn `peekaboo mcp` as a subprocess:
 
 ```javascript
 const { spawn } = require("child_process");
@@ -857,7 +854,7 @@ const mcp = spawn("peekaboo", ["mcp"], {
 // Tools available: see, click, type, scroll, hotkey, app, window, menu, etc.
 ```
 
-This gives you the same 25 automation tools but over the standard MCP JSON-RPC protocol instead of the bridge's custom envelope. The downside is you need the `peekaboo` binary installed and it spawns a new process.
+This gives you the same 25 automation tools but over the standard MCP JSON-RPC protocol instead of the bridge's custom envelope. The trade-off is you need the `peekaboo` binary installed and it spawns a new process per invocation.
 
 ## Choosing Between Bridge vs MCP vs CLI
 
@@ -867,4 +864,4 @@ This gives you the same 25 automation tools but over the standard MCP JSON-RPC p
 | **MCP stdio** | ~5-20ms per call | JSON-RPC over stdin/out | Any MCP client | Process-level |
 | **CLI subprocess** | ~100-500ms per call | exec + parse stdout | Any language | Process-level |
 
-For an agent making many rapid automation calls, the **bridge socket** is the best choice. It eliminates process spawn overhead entirely and gives you the lowest latency path to macOS automation APIs.
+For a client making many rapid automation calls, the **bridge socket** is the best choice. It eliminates process spawn overhead entirely and gives you the lowest latency path to macOS automation APIs.
