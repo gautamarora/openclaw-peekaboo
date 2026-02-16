@@ -63,7 +63,10 @@ Casper (root)
 │   ├── .id → number
 │   ├── .findAll(query) → Element[]
 │   ├── .find(query) → Element | null
-│   └── .waitFor(query, timeout?) → Element
+│   ├── .waitFor(query, timeout?) → Element
+│   ├── .findInPage(query) → Element[]
+│   ├── .waitForInPage(query, timeout?) → Element
+│   └── .snapshot(opts?) → Snapshot
 │
 ├── Element (AX UI element)
 │   ├── .role → string
@@ -153,6 +156,14 @@ Casper (root)
 ├── Menu
 │   ├── .click(path)                      → "File > Save As..."
 │   └── .items() → MenuItem[]
+│
+├── Snapshot (AX tree → text + handles)
+│   ├── .text → string
+│   ├── .refs → Map<number, Element>
+│   ├── .click(ref) → void
+│   ├── .type(ref, text) → void
+│   ├── .get(ref) → Element
+│   └── .dispose()
 │
 ├── Permissions
 │   ├── .check() → PermissionsStatus
@@ -1543,6 +1554,7 @@ casper/
 | **Finder** | Inherits from App | `HandleEntry::App` | No |
 | **Browser** | Inherits from App | `HandleEntry::App` | No |
 | **Script** | — | — | Yes |
+| **Snapshot** | ref→handle map | (TS-only, holds Element refs) | No |
 
 ---
 
@@ -2151,6 +2163,393 @@ impl ElementQuery {
 
 ---
 
+## Semantic Snapshots
+
+> Inspired by [OpenClaw](https://github.com/openclaw/openclaw)'s browser tool,
+> which parses the accessibility tree into structured text with element
+> references instead of sending screenshots to the LLM — ~100x cheaper in
+> tokens and more precise than pixel-coordinate guessing.
+
+### The problem
+
+An agent controlling a GUI needs to **see** what's on screen, then **act** on
+what it sees. There are three approaches:
+
+| Approach | Token cost | Precision | Handles UI changes? |
+|---|---|---|---|
+| **Screenshot** | ~1,500 tokens per image (base64) | Coordinate guessing from pixels | No — stale coordinates |
+| **Full AX dump** | Hundreds of elements, 5k+ tokens | Exact, but overwhelming | No — data snapshot |
+| **Semantic snapshot** | Compact text, ~200-500 tokens | Exact ref→handle mapping | Yes — refs hold live handles |
+
+Semantic snapshots are the sweet spot: compact enough for LLM context, precise
+enough for direct action, and backed by live handles so refs track UI changes.
+
+### The Snapshot entity
+
+`Window.snapshot()` walks the AX tree and produces a `Snapshot` — a text
+representation with numbered refs, plus a map from ref numbers to live
+`Element` handles:
+
+```typescript
+interface SnapshotOpts {
+  /** Maximum tree depth to walk (default: 10) */
+  maxDepth?: number;
+  /** Only snapshot web content (AXWebArea subtree) */
+  webContentOnly?: boolean;
+  /** Include element bounds in output (default: false) */
+  includeBounds?: boolean;
+  /** Roles to skip (e.g. ["AXGroup", "AXGenericElement"] to reduce noise) */
+  skipRoles?: string[];
+}
+
+export class Snapshot implements Disposable {
+  /** Compact text representation of the AX tree. */
+  readonly text: string;
+
+  /** Map from ref number to live Element handle. */
+  readonly refs: Map<number, Element>;
+
+  /** Click an element by its ref number. */
+  async click(ref: number): Promise<void> {
+    const el = this.refs.get(ref);
+    if (!el) throw new Error(`Unknown ref: ${ref}`);
+    await el.click();
+  }
+
+  /** Type text into an element by its ref number. */
+  async type(ref: number, text: string): Promise<void> {
+    const el = this.refs.get(ref);
+    if (!el) throw new Error(`Unknown ref: ${ref}`);
+    await el.type(text);
+  }
+
+  /** Get the Element handle for a ref. */
+  get(ref: number): Element {
+    const el = this.refs.get(ref);
+    if (!el) throw new Error(`Unknown ref: ${ref}`);
+    return el;
+  }
+
+  /** Release all Element handles held by this snapshot. */
+  dispose(): void {
+    for (const el of this.refs.values()) {
+      el.dispose();
+    }
+    this.refs.clear();
+  }
+
+  [Symbol.dispose](): void {
+    this.dispose();
+  }
+}
+```
+
+### Text format
+
+The snapshot text is a compact, indented tree with one line per meaningful
+element. Each actionable element gets a `[ref=N]` tag:
+
+```
+window "Spotify" [ref=1]
+  group "Now Playing Bar"
+    image "Album Art" [ref=2]
+    statictext "Bohemian Rhapsody"
+    statictext "Queen"
+    button "Previous" [ref=3]
+    button "Pause" [ref=4]
+    button "Next" [ref=5]
+    slider "Volume" value=75 [ref=6]
+  group "Main View"
+    heading "Made For You" level=1
+    list "Playlist Grid"
+      cell "Daily Mix 1" [ref=7]
+      cell "Daily Mix 2" [ref=8]
+      cell "Release Radar" [ref=9]
+    scrollbar vertical [ref=10]
+```
+
+Formatting rules:
+- Indent = nesting depth (2 spaces per level)
+- Skip structural-only groups that add no information
+- Include `value=` for sliders, text fields, checkboxes
+- Include `level=` for headings
+- Only assign refs to actionable elements (buttons, links, text fields,
+  sliders, cells, checkboxes, tabs)
+- Non-actionable text (statictext, headings) shown inline without refs
+- Roles are lowercased without the "AX" prefix for readability
+
+### Rust FFI surface
+
+```rust
+/// Generate a semantic snapshot of a window's AX tree.
+/// Returns JSON: { "text": "...", "refs": { "1": handle, "2": handle, ... } }
+#[unsafe(no_mangle)]
+pub extern "C" fn casper_window_snapshot(
+    handle: u64,
+    max_depth: u32,
+    web_content_only: u8,
+    include_bounds: u8,
+    skip_roles_json: *const u8, skip_roles_len: u32,
+    out_len: *mut u64,
+) -> *mut u8 {
+    let table = handles::table();
+    let map = table.as_ref().unwrap();
+    let ax = match map.get(&handle) {
+        Some(handles::HandleEntry::Window { ax, .. }) => ax,
+        _ => { unsafe { *out_len = 0; } return ptr::null_mut(); }
+    };
+
+    let root = if web_content_only != 0 {
+        // Find the first AXWebArea descendant
+        match ax.find_first(10, &|e| e.role().as_deref() == Some("AXWebArea")) {
+            Some(web_area) => web_area,
+            None => { unsafe { *out_len = 0; } return ptr::null_mut(); }
+        }
+    } else {
+        ax.clone()
+    };
+
+    let mut text = String::new();
+    let mut refs: HashMap<u32, u64> = HashMap::new();
+    let mut next_ref: u32 = 1;
+
+    fn walk(
+        elem: &crate::ax::AXElement,
+        depth: u32, max_depth: u32,
+        text: &mut String, refs: &mut HashMap<u32, u64>,
+        next_ref: &mut u32,
+        include_bounds: bool,
+    ) {
+        if depth > max_depth { return; }
+
+        let role = elem.role().unwrap_or_default();
+        let display_role = role.strip_prefix("AX").unwrap_or(&role).to_lowercase();
+        let title = elem.title();
+        let value = elem.value();
+        let indent = "  ".repeat(depth as usize);
+
+        let is_actionable = matches!(
+            role.as_str(),
+            "AXButton" | "AXLink" | "AXTextField" | "AXTextArea"
+            | "AXSlider" | "AXCheckBox" | "AXRadioButton"
+            | "AXPopUpButton" | "AXComboBox" | "AXCell"
+            | "AXTab" | "AXMenuItem" | "AXImage"
+            | "AXIncrementor" | "AXDisclosureTriangle"
+        );
+
+        // Build the line
+        let mut line = format!("{}{}", indent, display_role);
+        if let Some(ref t) = title {
+            if !t.is_empty() { line.push_str(&format!(" \"{}\"", t)); }
+        }
+        if let Some(ref v) = value {
+            if !v.is_empty() { line.push_str(&format!(" value={}", v)); }
+        }
+
+        if is_actionable {
+            let ref_id = *next_ref;
+            *next_ref += 1;
+            let elem_handle = handles::insert(handles::HandleEntry::AXElement(elem.clone()));
+            refs.insert(ref_id, elem_handle);
+            line.push_str(&format!(" [ref={}]", ref_id));
+        }
+
+        if include_bounds {
+            if let Some((x, y, w, h)) = elem.frame() {
+                line.push_str(&format!(" @({:.0},{:.0} {:.0}x{:.0})", x, y, w, h));
+            }
+        }
+
+        text.push_str(&line);
+        text.push('\n');
+
+        // Recurse into children
+        for child in elem.children() {
+            walk(&child, depth + 1, max_depth, text, refs, next_ref, include_bounds);
+        }
+    }
+
+    walk(&root, 0, max_depth, &mut text, &mut refs, &mut next_ref, include_bounds != 0);
+
+    let result = serde_json::json!({
+        "text": text,
+        "refs": refs,
+    });
+    json_to_ffi(&result, out_len)
+}
+```
+
+### Usage in an agent loop
+
+```typescript
+import { App, Keyboard, shutdown } from "./casper/mod.ts";
+
+const spotify = await App.find("Spotify");
+await spotify.activate();
+const win = await spotify.focusedWindow();
+
+// Take a semantic snapshot — much cheaper than a screenshot
+{
+  using snap = await win.snapshot();
+
+  // Send snap.text to the LLM as context (~300 tokens vs ~1,500 for an image):
+  //
+  // window "Spotify" [ref=1]
+  //   group "Now Playing Bar"
+  //     statictext "Bohemian Rhapsody"
+  //     statictext "Queen"
+  //     button "Pause" [ref=4]
+  //     button "Next" [ref=5]
+  //     slider "Volume" value=75 [ref=6]
+
+  // LLM responds: "click ref=5 to skip to next track"
+  await snap.click(5);
+
+  // Or get the element for more complex interaction:
+  const volumeSlider = snap.get(6);
+  const props = await volumeSlider.refresh();
+  console.log(`Volume: ${props.value}`);
+
+} // snap.dispose() called — all ref handles released
+```
+
+### Snapshots vs screenshots
+
+Snapshots don't replace screenshots — they complement them. An agent might:
+
+1. Take a **snapshot** for structured understanding (~300 tokens, actionable)
+2. Take a **screenshot** for visual verification (~1,500 tokens, read-only)
+3. Use snapshot refs to **act** without coordinate math
+
+```typescript
+// Snapshot for decision-making
+const snap = await win.snapshot();
+// → Send snap.text to LLM: "I see a Login button [ref=3] and a Sign Up link [ref=4]"
+
+// Screenshot for visual confirmation (optional)
+const png = await win.capture();
+// → Send to multimodal LLM: "Verify the page looks correct"
+
+// Act using snapshot refs (no coordinates needed)
+await snap.click(3);  // Click "Login"
+```
+
+### Web content snapshots
+
+For browser-hosted apps, use `webContentOnly` to skip browser chrome and focus
+on the page:
+
+```typescript
+const safari = await App.find("Safari");
+const win = await safari.focusedWindow();
+
+// Snapshot only the web page content
+const snap = await win.snapshot({ webContentOnly: true });
+// →
+// heading "Twitter / X" level=1
+//   group article [ref=1]
+//     link "@elonmusk" [ref=2]
+//     statictext "This is a tweet"
+//     button "Reply" [ref=3]
+//     button "Retweet" [ref=4]
+//     button "Like" [ref=5]
+//   group article [ref=6]
+//     ...
+
+await snap.click(5); // Like the tweet
+```
+
+---
+
+## Comparison: Casper vs OpenClaw
+
+> [OpenClaw](https://github.com/openclaw/openclaw) (formerly Clawdbot, by Peter
+> Steinberger, 40k+ GitHub stars) is an AI agent gateway that bridges messaging
+> apps to LLMs with the ability to act on your machine. OpenClaw actually uses
+> Peekaboo as its macOS GUI automation layer — Casper would replace/upgrade the
+> automation substrate that OpenClaw sits on top of.
+
+### Architecture comparison
+
+| | **OpenClaw** | **Casper** |
+|---|---|---|
+| **What it is** | AI agent gateway / orchestrator | Native automation engine |
+| **Core language** | Node.js / TypeScript | Rust (engine) + TypeScript (API) |
+| **How it controls Mac** | Delegates to Peekaboo CLI, AppleScript MCP, CDP | Direct AX handles, AppleScript, CGEvent — all in-process |
+| **Automation model** | CLI subprocess calls (`peekaboo see`, `peekaboo click`) | Entity methods (`element.click()`, `win.find()`) |
+| **State model** | Stateless — every command re-queries the world | Stateful handles — hold live references to AX elements |
+| **Type safety** | Skills are markdown instructions for the LLM | Full TypeScript types — `App`, `Window`, `Element`, `ElementQuery` |
+| **Performance** | Process spawn per action + JSON parsing | FFI call per action, handles avoid re-walking AX tree |
+| **Browser control** | CDP + Semantic Snapshots (ARIA tree → text) | AX tree via `findInPage()` + semantic snapshots |
+| **Knowledge system** | 53 bundled + 5,700 community skills (SKILL.md) | App Profiles (typed, bundled) |
+
+### What we borrowed from OpenClaw
+
+**1. Semantic Snapshots** — OpenClaw's browser tool parses the ARIA
+accessibility tree into compact text with element references (`button "Sign In"
+[ref=1]`) instead of sending screenshots. The agent says "click ref=1" — exact,
+cheap, no coordinate guessing. We adopted this as `Window.snapshot()`, with the
+key difference that Casper's refs map to **live Element handles** (not stale
+data), so they track UI changes.
+
+**2. Three-tier lazy loading** — OpenClaw avoids prompt bloat by loading skill
+knowledge progressively: name + description first (~30 tokens), then full
+instructions, then deep reference files. Our App Profiles follow the same
+pattern:
+
+```typescript
+export interface AppProfile {
+  // Tier 1: always loaded (tiny) — name, bundleId, description, scriptable
+  // Tier 2: loaded when agent targets this app — verbs, shortcuts, landmarks
+  // Tier 3: loaded on demand — referenceUrl, exampleFlows
+}
+```
+
+**3. Permission brokering awareness** — OpenClaw solves macOS TCC
+(Transparency, Consent, and Control) by having a signed GUI app own all
+permissions, brokering requests over a Unix socket. Casper should account for
+running in contexts without TCC grants by supporting PeekabooBridge fallback.
+
+**4. `exec` escape hatch** — Sometimes `osascript -e '...'` or `open -a
+Spotify` is the right call. A lightweight `System.exec()` escape hatch
+prevents over-engineering entity wrappers for one-off operations.
+
+### What makes Casper different
+
+**1. Live handles vs stateless CLI calls** — OpenClaw shells out to `peekaboo
+click --on B3`, spawning a process that walks the AX tree, finds the element,
+clicks, and exits. Every action starts from scratch. Casper's `element.click()`
+reads the live AXUIElement's current frame from a Rust handle table — the
+element was found once and held. This matters for multi-step interactions where
+UI shifts between actions.
+
+**2. Composable typed API vs interpreted markdown** — OpenClaw skills are prose
+instructions the LLM follows ("to search Spotify, run `peekaboo click --on
+<ref>`"). Casper is typed code that catches errors at write time, enables IDE
+completion, and composes with standard TypeScript control flow.
+
+**3. In-process FFI vs subprocess IPC** — OpenClaw shells out for every
+automation action — process spawn overhead, JSON serialization, stdout parsing.
+Casper calls Rust functions directly through Deno's FFI — microsecond overhead,
+zero serialization for handle-based operations.
+
+**4. Multi-plane coherence** — OpenClaw bolts on AppleScript via a separate MCP
+server (`macos-automator-mcp`). Casper integrates Script, AX, and
+keyboard/mouse as peer entities in a single API — the agent doesn't need to
+know which MCP server to call.
+
+### Summary: what to borrow, what to keep
+
+| Borrow from OpenClaw | Keep in Casper |
+|---|---|
+| Semantic Snapshots — AX tree → text with refs | Live handles — snapshot refs map to real Element handles |
+| Three-tier lazy loading for profiles | Typed profiles — TypeScript interfaces, not markdown |
+| Permission brokering awareness for daemon contexts | In-process FFI — no subprocess overhead |
+| `exec` escape hatch for shell commands | Multi-plane coherence — Script, AX, Input as peers |
+| Skill ecosystem idea — community-contributed profiles | Type-first composability — entities compose with TypeScript |
+
+---
+
 ## File Layout (updated)
 
 ```
@@ -2189,7 +2588,8 @@ casper/
     │   ├── finder.ts             # Finder extends App
     │   ├── file.ts               # File entity
     │   ├── dialog.ts             # Dialog entity
-    │   └── script.ts             # Script singleton (AppleScript)
+    │   ├── script.ts             # Script singleton (AppleScript)
+    │   └── snapshot.ts           # Snapshot entity (AX tree → text + refs)
     └── profiles/
         ├── types.ts              # AppProfile interface
         ├── mod.ts                # Profile registry
