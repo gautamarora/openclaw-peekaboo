@@ -102,6 +102,11 @@ Casper
 │   ├── .eval(source) → Record
 │   └── .canScript(app) → boolean
 │
+├── Shell                                (stateless — escape hatch for CLIs)
+│   ├── .exec(command, args?) → { stdout, stderr, code }
+│   ├── .execPipe(commands) → { stdout, stderr, code }
+│   └── .which(name) → string | null
+│
 └── Permissions
     ├── .check() → PermissionsStatus
     ├── .accessibility → boolean
@@ -110,12 +115,12 @@ Casper
 
 App-specific entities (Browser, Mail, MusicPlayer) inherit all of App's
 handle-based powers (windows, focus, activate, snapshot) and add typed
-methods for domain actions. Internally they use Script.tell() or AX — but
-callers never see raw AppleScript strings.
+methods for domain actions. Internally they pick the best tool — Script,
+Shell, AX, or fetch — but callers never see raw strings.
 
 Entities that hold state (App, Window, Element) have handles backed by live
 Rust-side objects. Stateless entities (Keyboard, Mouse, Screen, Clipboard,
-Script) are global singletons that call macOS APIs directly.
+Script, Shell) are global singletons that call macOS APIs directly.
 
 ---
 
@@ -773,6 +778,7 @@ export { Keyboard } from "./entities/keyboard.ts";
 export { Mouse } from "./entities/mouse.ts";
 export { Screen } from "./entities/screen.ts";
 export { Clipboard } from "./entities/clipboard.ts";
+export { Shell } from "./entities/shell.ts";
 export { Browser } from "./entities/browser.ts";
 export { Mail } from "./entities/mail.ts";
 export { MusicPlayer } from "./entities/music-player.ts";
@@ -1144,22 +1150,20 @@ await snap.click(5);     // LLM said "click ref 5"
 
 ---
 
-## AppleScript & Script
+## Escape Hatches: Script & Shell
 
-AX and AppleScript are complementary:
+Casper has four ways to talk to apps. Two are typed (entities, AX queries).
+Two are escape hatches for when typed coverage doesn't exist yet:
 
-| | AX | AppleScript |
+| | What it does | Transport |
 |---|---|---|
-| **Gives you** | UI structure (buttons, positions) | Semantic verbs (`play track`, `set volume`) |
-| **Works on** | Every GUI app | Only apps with `.sdef` dictionaries |
-| **Speed** | Must walk element tree | Direct command dispatch |
-| **Best for** | Clicking elements, reading layout | App-specific actions, state queries |
+| **Script** | AppleScript verbs (`play track`, `set URL`) | NSAppleScript via Rust FFI |
+| **Shell** | CLI commands (`git commit`, `brew install`) | Deno.Command subprocess |
 
-### The Script entity — an escape hatch
+Both are like `eval()` in JavaScript: powerful, untyped, no autocomplete.
+The typed entity is always preferred. These exist for the long tail.
 
-`Script` is to Casper what `eval()` is to JavaScript: powerful, but untyped.
-App-specific entity subclasses exist so that callers don't need Script directly.
-Use Script as a last resort for one-off automation of apps without a typed entity.
+### Script
 
 ```typescript
 export const Script = {
@@ -1175,25 +1179,73 @@ export const Script = {
 };
 ```
 
-### When to use what
+### Shell
+
+```typescript
+export const Shell = {
+  async exec(command: string, args?: string[]): Promise<{ stdout: string; stderr: string; code: number }> {
+    const cmd = new Deno.Command(command, { args, stdout: "piped", stderr: "piped" });
+    const result = await cmd.output();
+    return {
+      stdout: new TextDecoder().decode(result.stdout),
+      stderr: new TextDecoder().decode(result.stderr),
+      code: result.code,
+    };
+  },
+
+  /** Pipe multiple commands together. */
+  async execPipe(commands: string[][]): Promise<{ stdout: string; stderr: string; code: number }> {
+    // chain Deno.Command instances with piped stdin/stdout
+  },
+
+  /** Check if a CLI exists on PATH. */
+  async which(name: string): Promise<string | null> {
+    const result = await this.exec("which", [name]);
+    return result.code === 0 ? result.stdout.trim() : null;
+  },
+};
+```
+
+Shell doesn't need Rust FFI — Deno has `Deno.Command` built in. The entity
+just provides a consistent API shape and result type.
+
+### When to use what (for callers)
 
 ```
 Has a typed entity? (Browser, Mail, MusicPlayer)
   → Use the entity                             ← typed, autocomplete, no raw strings
   → browser.navigate(url)                      ← NOT Script.tell("Safari", "...")
+  → spotify.play()                             ← NOT Shell.exec("spotify-cli", ["play"])
 
-Unknown scriptable app?
-  → Script.tell() as escape hatch              ← still better than AX for verbs
-
-Non-scriptable app (Electron, random GUI)?
-  → AX: find → click → type                   ← always works
-
-App with an HTTP API (Gmail, Obsidian)?
-  → Just use fetch()                           ← it's TypeScript
+No typed entity?
+  → Script.tell() for scriptable apps          ← fast, semantic verbs
+  → Shell.exec() for CLI-driven tools          ← git, docker, brew, ffmpeg
+  → AX: find → click → type                   ← always works for GUI apps
+  → fetch() for HTTP APIs                      ← Obsidian, local servers
 ```
 
-The entity is always preferred over Script. Script is always preferred over
-raw AX tree walking for verb-like actions. AX is for UI structure.
+### When to use what (for entity implementations)
+
+Typed entities pick the best tool internally. Same entity, different backing:
+
+```typescript
+// MusicPlayer uses Script — Spotify has a rich .sdef
+async play(uri?: string) {
+  await Script.tell(this.name, uri ? `play track "${uri}"` : "play");
+}
+
+// A hypothetical Git entity uses Shell — git's CLI is the interface
+async commit(message: string) {
+  return await Shell.exec("git", ["commit", "-m", message]);
+}
+
+// A hypothetical Obsidian entity uses fetch — it has a local REST API
+async createNote(title: string, content: string) {
+  await fetch("http://localhost:27123/vault/" + title, { method: "PUT", body: content });
+}
+```
+
+The caller doesn't know or care which escape hatch the entity chose.
 
 ---
 
@@ -1351,7 +1403,8 @@ casper/
     │   ├── mouse.ts
     │   ├── screen.ts
     │   ├── clipboard.ts
-    │   ├── script.ts             # escape hatch — raw AppleScript
+    │   ├── script.ts             # escape hatch — AppleScript
+    │   ├── shell.ts              # escape hatch — CLI subprocess
     │   └── snapshot.ts
     └── test/
         ├── browser_test.ts
