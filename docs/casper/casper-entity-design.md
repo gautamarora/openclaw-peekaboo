@@ -3711,6 +3711,1080 @@ export const interactWithPage: Recipe<{ instruction: string }, string> = {
 
 ---
 
+## Worked Example: Gmail
+
+Gmail is the ideal worked example because it exposes the hard design
+questions. Unlike Spotify (scriptable, one window, clear verbs) or Finder
+(native, deep AppleScript), Gmail has **four possible automation surfaces**,
+each with different trade-offs:
+
+| Surface | Mechanism | Best for | Limitations |
+|---|---|---|---|
+| **Apple Mail** | Script plane — rich `.sdef` | Read/send/search | Only works if user uses Apple Mail |
+| **Gmail in browser** | Native plane — AX + snapshots | Any browser, no auth needed | Deep AX trees, dynamic loading, fragile selectors |
+| **Gmail in browser + CDP** | Module plane — JS eval | DOM precision, fast batch reads | Requires Chrome/Arc with CDP enabled |
+| **Gmail API** | Module plane — HTTPS REST | Read/send/search/labels — structured data | Requires OAuth token, network |
+
+The right answer isn't one of these — it's **all of them, selected
+automatically** based on what's available.
+
+### The Gmail profile
+
+```typescript
+// casper/profiles/gmail.ts
+import type { AppProfile } from "./types.ts";
+
+/**
+ * Gmail is unusual: it's primarily a web app, but many users access it
+ * through Apple Mail, or through a Chromium browser where CDP is available.
+ * The profile declares all available channels so recipes can pick the best one.
+ */
+export const gmail: AppProfile = {
+  // Gmail doesn't have a native bundle ID — it lives inside a browser.
+  // We use a virtual bundle ID that recipes match against.
+  bundleId: "com.google.gmail",
+  name: "Gmail",
+  scriptable: false,  // No AppleScript dictionary (it's a web app)
+
+  shortcuts: {
+    // Gmail's web keyboard shortcuts (must be enabled in Gmail Settings)
+    compose: "c",
+    reply: "r",
+    replyAll: "a",
+    forward: "f",
+    archive: "e",
+    delete: "#",
+    search: "/",
+    nextMessage: "j",
+    prevMessage: "k",
+    openMessage: "o",       // or Enter
+    goToInbox: "g then i",
+    goToSent: "g then t",
+    goToDrafts: "g then d",
+    selectConversation: "x",
+    star: "s",
+    markRead: "shift+i",
+    markUnread: "shift+u",
+    send: "cmd+return",     // macOS-specific
+  },
+
+  landmarks: {
+    // Gmail's AX tree has recognizable landmarks (surprisingly stable)
+    composeButton: { role: "AXButton", descriptionContains: "Compose" },
+    searchBox: { role: "AXTextField", label: "Search mail" },
+    messageList: { role: "AXTable", descriptionContains: "conversations" },
+    messageBody: { role: "AXWebArea" },  // nested inside the message view
+    sendButton: { role: "AXButton", descriptionContains: "Send" },
+    toField: { role: "AXTextField", label: "To" },
+    subjectField: { role: "AXTextField", label: "Subject" },
+    bodyEditor: { role: "AXTextArea", descriptionContains: "Message Body" },
+  },
+
+  modules: {
+    // Gmail doesn't expose a local HTTP server, but we can use:
+    // 1. CDP (if the browser supports it) for DOM-level automation
+    // 2. Gmail API over HTTPS for structured data access
+    cdp: {
+      defaultPort: 9222,
+      launchArgs: ["--remote-debugging-port=9222"],
+    },
+    api: {
+      // OAuth-based Google API — token managed in ~/.casper/tokens/google.json
+      baseUrl: "https://gmail.googleapis.com/gmail/v1",
+      scopes: [
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/gmail.send",
+        "https://www.googleapis.com/auth/gmail.modify",
+      ],
+    },
+  },
+};
+
+/**
+ * Apple Mail profile — the native client that syncs Gmail via IMAP.
+ * If the user has Apple Mail configured with their Gmail account,
+ * this is the most reliable automation path.
+ */
+export const appleMail: AppProfile = {
+  bundleId: "com.apple.mail",
+  name: "Mail",
+  scriptable: true,
+
+  verbs: {
+    newMessage: (to: string, subject: string, body: string) =>
+      `make new outgoing message with properties {subject:"${subject}", content:"${body}", visible:true}`,
+    send: "send theMessage",
+    getInbox: `
+      set msgs to messages of mailbox "INBOX"
+      set result to {}
+      repeat with m in (items 1 thru (min of {20, count of msgs}) of msgs)
+        set end of result to {subject:subject of m, sender:sender of m, dateReceived:date received of m, readStatus:read status of m, id:id of m}
+      end repeat
+      return result
+    `,
+    getMessage: (id: string) => `
+      set m to first message of mailbox "INBOX" whose id is ${id}
+      return {subject:subject of m, sender:sender of m, content:content of m, dateReceived:date received of m}
+    `,
+    search: (query: string) => `
+      set results to (messages of mailbox "INBOX" whose subject contains "${query}" or sender contains "${query}")
+      set output to {}
+      repeat with m in (items 1 thru (min of {10, count of results}) of results)
+        set end of output to {subject:subject of m, sender:sender of m, id:id of m}
+      end repeat
+      return output
+    `,
+    markRead: (id: string) => `set read status of (first message of mailbox "INBOX" whose id is ${id}) to true`,
+    archive: (id: string) => `move (first message of mailbox "INBOX" whose id is ${id}) to mailbox "All Mail"`,
+  },
+
+  shortcuts: {
+    newMessage: "cmd+n",
+    reply: "cmd+r",
+    replyAll: "cmd+shift+r",
+    forward: "cmd+shift+f",
+    send: "cmd+shift+d",
+    search: "cmd+opt+f",
+    archive: "ctrl+cmd+a",
+  },
+
+  queries: {
+    unreadCount: "return count of (messages of mailbox \"INBOX\" whose read status is false)",
+    inboxCount: "return count of messages of mailbox \"INBOX\"",
+    accountNames: "return name of every account",
+  },
+
+  landmarks: {
+    messageList: { role: "AXTable", identifier: "MessageList" },
+    messageViewer: { role: "AXWebArea" },  // Mail renders HTML emails in a web view
+    searchField: { role: "AXTextField", identifier: "SearchField" },
+  },
+};
+```
+
+### Gmail module: API access
+
+```typescript
+// casper/modules/gmail-api.ts
+//
+// Wraps the Gmail REST API. Requires an OAuth token stored at
+// ~/.casper/tokens/google.json (obtained via `casper auth google`).
+
+import { resolve } from "jsr:@std/path";
+
+interface GmailMessage {
+  id: string;
+  threadId: string;
+  snippet: string;
+  from: string;
+  to: string;
+  subject: string;
+  date: string;
+  body: string;
+  labels: string[];
+  unread: boolean;
+}
+
+interface GmailThread {
+  id: string;
+  snippet: string;
+  messages: GmailMessage[];
+}
+
+async function getToken(): Promise<string> {
+  const home = Deno.env.get("HOME")!;
+  const tokenPath = resolve(home, ".casper/tokens/google.json");
+  const data = JSON.parse(await Deno.readTextFile(tokenPath));
+
+  // Check if token is expired and refresh if needed
+  if (data.expiry && Date.now() > data.expiry) {
+    return await refreshToken(data, tokenPath);
+  }
+  return data.access_token;
+}
+
+async function refreshToken(data: Record<string, unknown>, path: string): Promise<string> {
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: data.client_id as string,
+      client_secret: data.client_secret as string,
+      refresh_token: data.refresh_token as string,
+      grant_type: "refresh_token",
+    }),
+  });
+  const refreshed = await res.json();
+  const updated = {
+    ...data,
+    access_token: refreshed.access_token,
+    expiry: Date.now() + (refreshed.expires_in * 1000),
+  };
+  await Deno.writeTextFile(path, JSON.stringify(updated, null, 2));
+  return refreshed.access_token;
+}
+
+async function gmailFetch(endpoint: string, opts?: RequestInit): Promise<unknown> {
+  const token = await getToken();
+  const res = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/${endpoint}`, {
+    ...opts,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      ...opts?.headers,
+    },
+  });
+  if (!res.ok) throw new Error(`Gmail API error: ${res.status} ${await res.text()}`);
+  return res.json();
+}
+
+function decodeBody(payload: Record<string, unknown>): string {
+  // Gmail API returns base64url-encoded bodies
+  const parts = payload.parts as Array<Record<string, unknown>> | undefined;
+  if (parts) {
+    const textPart = parts.find((p) => (p.mimeType as string) === "text/plain");
+    if (textPart) {
+      const data = (textPart.body as Record<string, unknown>).data as string;
+      return atob(data.replace(/-/g, "+").replace(/_/g, "/"));
+    }
+  }
+  const body = payload.body as Record<string, unknown>;
+  if (body?.data) {
+    return atob((body.data as string).replace(/-/g, "+").replace(/_/g, "/"));
+  }
+  return "";
+}
+
+function parseHeaders(headers: Array<{ name: string; value: string }>): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (const h of headers) {
+    map[h.name.toLowerCase()] = h.value;
+  }
+  return map;
+}
+
+function parseMessage(raw: Record<string, unknown>): GmailMessage {
+  const payload = raw.payload as Record<string, unknown>;
+  const headers = parseHeaders(payload.headers as Array<{ name: string; value: string }>);
+  const labels = raw.labelIds as string[] ?? [];
+  return {
+    id: raw.id as string,
+    threadId: raw.threadId as string,
+    snippet: raw.snippet as string,
+    from: headers["from"] ?? "",
+    to: headers["to"] ?? "",
+    subject: headers["subject"] ?? "",
+    date: headers["date"] ?? "",
+    body: decodeBody(payload),
+    labels,
+    unread: labels.includes("UNREAD"),
+  };
+}
+
+// --- Exported functions ---
+
+export async function listInbox(maxResults = 20): Promise<GmailMessage[]> {
+  const data = await gmailFetch(
+    `messages?labelIds=INBOX&maxResults=${maxResults}`
+  ) as { messages: Array<{ id: string }> };
+
+  if (!data.messages?.length) return [];
+
+  // Batch fetch message details
+  const messages = await Promise.all(
+    data.messages.map(async (m) => {
+      const full = await gmailFetch(`messages/${m.id}?format=full`) as Record<string, unknown>;
+      return parseMessage(full);
+    })
+  );
+  return messages;
+}
+
+export async function getMessage(id: string): Promise<GmailMessage> {
+  const full = await gmailFetch(`messages/${id}?format=full`) as Record<string, unknown>;
+  return parseMessage(full);
+}
+
+export async function searchMessages(query: string, maxResults = 10): Promise<GmailMessage[]> {
+  const data = await gmailFetch(
+    `messages?q=${encodeURIComponent(query)}&maxResults=${maxResults}`
+  ) as { messages: Array<{ id: string }> };
+
+  if (!data.messages?.length) return [];
+
+  const messages = await Promise.all(
+    data.messages.map(async (m) => {
+      const full = await gmailFetch(`messages/${m.id}?format=full`) as Record<string, unknown>;
+      return parseMessage(full);
+    })
+  );
+  return messages;
+}
+
+export async function sendMessage(to: string, subject: string, body: string): Promise<string> {
+  const raw = [
+    `To: ${to}`,
+    `Subject: ${subject}`,
+    "Content-Type: text/plain; charset=utf-8",
+    "",
+    body,
+  ].join("\r\n");
+
+  const encoded = btoa(raw).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
+  const result = await gmailFetch("messages/send", {
+    method: "POST",
+    body: JSON.stringify({ raw: encoded }),
+  }) as { id: string };
+
+  return result.id;
+}
+
+export async function createDraft(to: string, subject: string, body: string): Promise<string> {
+  const raw = [
+    `To: ${to}`,
+    `Subject: ${subject}`,
+    "Content-Type: text/plain; charset=utf-8",
+    "",
+    body,
+  ].join("\r\n");
+
+  const encoded = btoa(raw).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
+  const result = await gmailFetch("drafts", {
+    method: "POST",
+    body: JSON.stringify({ message: { raw: encoded } }),
+  }) as { id: string };
+
+  return result.id;
+}
+
+export async function replyToMessage(
+  messageId: string,
+  body: string,
+): Promise<string> {
+  const original = await getMessage(messageId);
+
+  const raw = [
+    `To: ${original.from}`,
+    `Subject: Re: ${original.subject}`,
+    `In-Reply-To: ${messageId}`,
+    `References: ${messageId}`,
+    "Content-Type: text/plain; charset=utf-8",
+    "",
+    body,
+    "",
+    `On ${original.date}, ${original.from} wrote:`,
+    ...original.body.split("\n").map((line) => `> ${line}`),
+  ].join("\r\n");
+
+  const encoded = btoa(raw).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
+  const result = await gmailFetch("messages/send", {
+    method: "POST",
+    body: JSON.stringify({ raw: encoded, threadId: original.threadId }),
+  }) as { id: string };
+
+  return result.id;
+}
+
+export async function markAsRead(messageId: string): Promise<void> {
+  await gmailFetch(`messages/${messageId}/modify`, {
+    method: "POST",
+    body: JSON.stringify({ removeLabelIds: ["UNREAD"] }),
+  });
+}
+
+export async function archive(messageId: string): Promise<void> {
+  await gmailFetch(`messages/${messageId}/modify`, {
+    method: "POST",
+    body: JSON.stringify({ removeLabelIds: ["INBOX"] }),
+  });
+}
+
+export async function getUnreadCount(): Promise<number> {
+  const data = await gmailFetch(
+    "messages?labelIds=INBOX&labelIds=UNREAD&maxResults=1"
+  ) as { resultSizeEstimate: number };
+  return data.resultSizeEstimate;
+}
+```
+
+### Gmail recipes: multi-plane selection
+
+The recipes are where the planes get selected. Each recipe tries the best
+available path and falls back gracefully:
+
+```typescript
+// casper/recipes/gmail.ts
+import { App, Script, Keyboard, Browser } from "../entities/mod.ts";
+import { getProfile } from "../profiles/mod.ts";
+import * as gmailApi from "../modules/gmail-api.ts";
+import type { Recipe } from "./types.ts";
+
+// --- Types ---
+
+interface EmailSummary {
+  id: string;
+  from: string;
+  subject: string;
+  snippet: string;
+  date: string;
+  unread: boolean;
+}
+
+interface EmailFull {
+  id: string;
+  from: string;
+  to: string;
+  subject: string;
+  date: string;
+  body: string;
+}
+
+// --- Plane detection ---
+
+/** Determine which automation surface is available, in priority order. */
+async function detectGmailPlane(): Promise<"api" | "apple-mail" | "browser"> {
+  // 1. Best: Gmail API token exists → structured data, no UI needed
+  try {
+    const home = Deno.env.get("HOME")!;
+    await Deno.stat(`${home}/.casper/tokens/google.json`);
+    return "api";
+  } catch { /* no token */ }
+
+  // 2. Good: Apple Mail is running and has accounts configured
+  if (await Script.canScript("Mail")) {
+    try {
+      const accounts = await Script.tell("Mail", "return count of accounts");
+      if (accounts && parseInt(accounts) > 0) return "apple-mail";
+    } catch { /* Mail not configured */ }
+  }
+
+  // 3. Fallback: browser automation
+  return "browser";
+}
+
+// --- Recipes ---
+
+export const inbox: Recipe<{ count?: number }, EmailSummary[]> = {
+  meta: {
+    name: "gmail.inbox",
+    description: "List recent inbox messages",
+    category: "email",
+    params: {
+      count: { type: "number", description: "Number of messages (default: 20)" },
+    },
+  },
+
+  async execute({ count = 20 }) {
+    const plane = await detectGmailPlane();
+
+    switch (plane) {
+      case "api": {
+        // Best path: structured data from Gmail API
+        const messages = await gmailApi.listInbox(count);
+        return messages.map((m) => ({
+          id: m.id,
+          from: m.from,
+          subject: m.subject,
+          snippet: m.snippet,
+          date: m.date,
+          unread: m.unread,
+        }));
+      }
+
+      case "apple-mail": {
+        // Good path: AppleScript
+        const raw = await Script.eval(`
+          tell application "Mail"
+            set msgs to messages of mailbox "INBOX"
+            set result to {}
+            repeat with m in (items 1 thru (min of {${count}, count of msgs}) of msgs)
+              set end of result to {subject:subject of m, sender:sender of m, ¬
+                dateReceived:date received of m as string, readStatus:read status of m, ¬
+                id:id of m}
+            end repeat
+            return result
+          end tell
+        `);
+        // Parse AppleScript record list → EmailSummary[]
+        return parseAppleScriptMessages(raw);
+      }
+
+      case "browser": {
+        // Fallback: snapshot the Gmail web UI
+        const browser = await findGmailBrowser();
+        const win = await browser.focusedWindow();
+        using snap = await win.snapshot({ webContentOnly: true, maxDepth: 6 });
+
+        // The snapshot text shows the message list — return it as structured data
+        // by parsing the snapshot refs for table rows
+        return parseGmailSnapshot(snap);
+      }
+    }
+  },
+};
+
+export const readMessage: Recipe<{ id: string }, EmailFull> = {
+  meta: {
+    name: "gmail.read",
+    description: "Read a specific email message",
+    category: "email",
+    params: {
+      id: { type: "string", description: "Message ID", required: true },
+    },
+  },
+
+  async execute({ id }) {
+    const plane = await detectGmailPlane();
+
+    switch (plane) {
+      case "api": {
+        const msg = await gmailApi.getMessage(id);
+        await gmailApi.markAsRead(id);
+        return {
+          id: msg.id,
+          from: msg.from,
+          to: msg.to,
+          subject: msg.subject,
+          date: msg.date,
+          body: msg.body,
+        };
+      }
+
+      case "apple-mail": {
+        const raw = await Script.eval(`
+          tell application "Mail"
+            set m to first message of mailbox "INBOX" whose id is ${id}
+            set read status of m to true
+            return {subject:subject of m, sender:sender of m, ¬
+              content:content of m, dateReceived:date received of m as string, ¬
+              recipientAddr:address of first to recipient of m}
+          end tell
+        `);
+        return parseAppleScriptFullMessage(raw, id);
+      }
+
+      case "browser": {
+        // Click the message row, snapshot the opened message
+        const browser = await findGmailBrowser();
+        const win = await browser.focusedWindow();
+
+        // Navigate to the message by clicking its row
+        using listSnap = await win.snapshot({ webContentOnly: true });
+        const row = findMessageRow(listSnap, id);
+        if (row) await listSnap.click(row);
+
+        // Wait for message to load, then snapshot it
+        await new Promise((r) => setTimeout(r, 1000));
+        using msgSnap = await win.snapshot({ webContentOnly: true, maxDepth: 8 });
+        return parseGmailMessageSnapshot(msgSnap, id);
+      }
+    }
+  },
+};
+
+export const compose: Recipe<{
+  to: string;
+  subject: string;
+  body: string;
+  send?: boolean;
+}, { id: string; status: string }> = {
+  meta: {
+    name: "gmail.compose",
+    description: "Compose and optionally send an email",
+    category: "email",
+    params: {
+      to: { type: "string", description: "Recipient email address", required: true },
+      subject: { type: "string", description: "Email subject", required: true },
+      body: { type: "string", description: "Email body text", required: true },
+      send: { type: "boolean", description: "Send immediately (default: false, saves as draft)" },
+    },
+  },
+
+  async execute({ to, subject, body, send = false }) {
+    const plane = await detectGmailPlane();
+
+    switch (plane) {
+      case "api": {
+        if (send) {
+          const id = await gmailApi.sendMessage(to, subject, body);
+          return { id, status: "sent" };
+        } else {
+          const id = await gmailApi.createDraft(to, subject, body);
+          return { id, status: "draft" };
+        }
+      }
+
+      case "apple-mail": {
+        const sendCmd = send
+          ? "send theMessage"
+          : "";  // Just leave it open as a draft
+        await Script.eval(`
+          tell application "Mail"
+            set theMessage to make new outgoing message with properties ¬
+              {subject:"${escapeAppleScript(subject)}", ¬
+               content:"${escapeAppleScript(body)}", ¬
+               visible:true}
+            tell theMessage
+              make new to recipient at end of to recipients ¬
+                with properties {address:"${escapeAppleScript(to)}"}
+            end tell
+            ${sendCmd}
+          end tell
+        `);
+        return { id: "apple-mail-pending", status: send ? "sent" : "draft" };
+      }
+
+      case "browser": {
+        const browser = await findGmailBrowser();
+        const win = await browser.focusedWindow();
+
+        // Click Compose (or press 'c' if Gmail keyboard shortcuts are enabled)
+        using snap = await win.snapshot({ webContentOnly: true });
+        const composeBtn = findByLandmark(snap, "Compose");
+        if (composeBtn) {
+          await snap.click(composeBtn);
+        } else {
+          await Keyboard.press("c");
+        }
+
+        // Wait for compose window to appear
+        await new Promise((r) => setTimeout(r, 800));
+
+        // Fill in fields — use keyboard navigation since Gmail's compose
+        // window has a predictable tab order: To → Cc → Subject → Body
+        await Keyboard.type(to);
+        await Keyboard.press("tab");
+        // Skip Cc/Bcc
+        await Keyboard.type(subject);
+        await Keyboard.press("tab");
+        await Keyboard.type(body);
+
+        if (send) {
+          await Keyboard.hotkey("cmd+return");  // Gmail's send shortcut
+          return { id: "browser-sent", status: "sent" };
+        }
+
+        // Leave as draft (Gmail auto-saves)
+        return { id: "browser-draft", status: "draft" };
+      }
+    }
+  },
+};
+
+export const reply: Recipe<{
+  id: string;
+  body: string;
+  send?: boolean;
+}, { id: string; status: string }> = {
+  meta: {
+    name: "gmail.reply",
+    description: "Reply to an email message",
+    category: "email",
+    params: {
+      id: { type: "string", description: "Message ID to reply to", required: true },
+      body: { type: "string", description: "Reply text", required: true },
+      send: { type: "boolean", description: "Send immediately (default: false)" },
+    },
+  },
+
+  async execute({ id, body, send = false }) {
+    const plane = await detectGmailPlane();
+
+    switch (plane) {
+      case "api": {
+        if (send) {
+          const replyId = await gmailApi.replyToMessage(id, body);
+          return { id: replyId, status: "sent" };
+        } else {
+          // API doesn't have a clean "reply draft" — create a draft with headers
+          const original = await gmailApi.getMessage(id);
+          const draftId = await gmailApi.createDraft(
+            original.from,
+            `Re: ${original.subject}`,
+            body,
+          );
+          return { id: draftId, status: "draft" };
+        }
+      }
+
+      case "apple-mail": {
+        await Script.eval(`
+          tell application "Mail"
+            set m to first message of mailbox "INBOX" whose id is ${id}
+            set theReply to reply m with opening window
+            set content of theReply to "${escapeAppleScript(body)}" & content of theReply
+            ${send ? "send theReply" : ""}
+          end tell
+        `);
+        return { id: `apple-mail-reply-${id}`, status: send ? "sent" : "draft" };
+      }
+
+      case "browser": {
+        // First open the message
+        await readMessage.execute({ id });
+        await new Promise((r) => setTimeout(r, 500));
+
+        // Press 'r' to reply (Gmail shortcut)
+        await Keyboard.press("r");
+        await new Promise((r) => setTimeout(r, 500));
+
+        // Type the reply
+        await Keyboard.type(body);
+
+        if (send) {
+          await Keyboard.hotkey("cmd+return");
+          return { id: `browser-reply-${id}`, status: "sent" };
+        }
+        return { id: `browser-reply-${id}`, status: "draft" };
+      }
+    }
+  },
+};
+
+export const search: Recipe<{ query: string; count?: number }, EmailSummary[]> = {
+  meta: {
+    name: "gmail.search",
+    description: "Search Gmail messages",
+    category: "email",
+    params: {
+      query: { type: "string", description: "Search query (Gmail syntax)", required: true },
+      count: { type: "number", description: "Max results (default: 10)" },
+    },
+  },
+
+  async execute({ query, count = 10 }) {
+    const plane = await detectGmailPlane();
+
+    switch (plane) {
+      case "api": {
+        const messages = await gmailApi.searchMessages(query, count);
+        return messages.map((m) => ({
+          id: m.id,
+          from: m.from,
+          subject: m.subject,
+          snippet: m.snippet,
+          date: m.date,
+          unread: m.unread,
+        }));
+      }
+
+      case "apple-mail": {
+        const raw = await Script.eval(`
+          tell application "Mail"
+            set results to (messages of mailbox "INBOX" ¬
+              whose subject contains "${escapeAppleScript(query)}" ¬
+              or sender contains "${escapeAppleScript(query)}")
+            set output to {}
+            repeat with m in (items 1 thru (min of {${count}, count of results}) of results)
+              set end of output to {subject:subject of m, sender:sender of m, ¬
+                id:id of m, readStatus:read status of m, ¬
+                dateReceived:date received of m as string}
+            end repeat
+            return output
+          end tell
+        `);
+        return parseAppleScriptMessages(raw);
+      }
+
+      case "browser": {
+        const browser = await findGmailBrowser();
+        const win = await browser.focusedWindow();
+
+        // Focus the search box and type the query
+        await Keyboard.press("/");
+        await new Promise((r) => setTimeout(r, 300));
+        await Keyboard.type(query);
+        await Keyboard.press("return");
+
+        // Wait for results to load
+        await new Promise((r) => setTimeout(r, 1500));
+        using snap = await win.snapshot({ webContentOnly: true, maxDepth: 6 });
+        return parseGmailSnapshot(snap);
+      }
+    }
+  },
+};
+
+export const unreadCount: Recipe<void, number> = {
+  meta: {
+    name: "gmail.unread",
+    description: "Get the number of unread messages in inbox",
+    category: "email",
+    params: {},
+  },
+
+  async execute() {
+    const plane = await detectGmailPlane();
+
+    switch (plane) {
+      case "api":
+        return await gmailApi.getUnreadCount();
+
+      case "apple-mail": {
+        const raw = await Script.tell("Mail",
+          'return count of (messages of mailbox "INBOX" whose read status is false)');
+        return parseInt(raw ?? "0");
+      }
+
+      case "browser": {
+        // Gmail shows unread count in the page title: "Inbox (3) - Gmail"
+        const browser = await findGmailBrowser();
+        const win = await browser.focusedWindow();
+        const title = await win.title();
+        const match = title?.match(/\((\d+)\)/);
+        return match ? parseInt(match[1]) : 0;
+      }
+    }
+  },
+};
+
+// --- Helpers ---
+
+function escapeAppleScript(s: string): string {
+  return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+async function findGmailBrowser(): Promise<InstanceType<typeof Browser>> {
+  // Look for any browser with a Gmail tab open
+  for (const appName of ["Safari", "Google Chrome", "Arc", "Firefox"]) {
+    const app = await App.find(appName);
+    if (!app) continue;
+
+    // Check if any window title contains "Gmail" or "Inbox"
+    const windows = await app.windows();
+    for (const win of windows) {
+      const title = await win.title();
+      if (title?.includes("Gmail") || title?.includes("Inbox")) {
+        await app.activate();
+        return app as InstanceType<typeof Browser>;
+      }
+    }
+  }
+
+  // No Gmail tab found — open one
+  const safari = await Browser.findOrLaunch("com.apple.Safari");
+  await Script.tell("Safari", 'open location "https://mail.google.com"');
+  await new Promise((r) => setTimeout(r, 3000));
+  return safari;
+}
+
+function findByLandmark(snap: { refs: Map<number, unknown> }, label: string): number | null {
+  // Search snapshot refs for an element matching the label
+  for (const [ref] of snap.refs) {
+    // Implementation would check the element properties
+    // Simplified here — real impl would use snap.text parsing
+    if (snap.text.includes(`"${label}"`)) return ref;
+  }
+  return null;
+}
+
+function findMessageRow(_snap: unknown, _id: string): number | null {
+  // Parse snapshot to find the row corresponding to a message
+  return null; // Simplified — real impl would parse snapshot refs
+}
+
+// Parser stubs — real implementations would handle AppleScript record
+// format and Gmail's AX tree structure
+function parseAppleScriptMessages(_raw: unknown): EmailSummary[] { return []; }
+function parseAppleScriptFullMessage(_raw: unknown, _id: string): EmailFull {
+  return { id: "", from: "", to: "", subject: "", date: "", body: "" };
+}
+function parseGmailSnapshot(_snap: unknown): EmailSummary[] { return []; }
+function parseGmailMessageSnapshot(_snap: unknown, _id: string): EmailFull {
+  return { id: "", from: "", to: "", subject: "", date: "", body: "" };
+}
+```
+
+### What this looks like from every surface
+
+**CLI:**
+```
+$ casper gmail.inbox --count 5
+[
+  { "id": "abc123", "from": "alice@...", "subject": "Meeting tomorrow", "unread": true },
+  { "id": "def456", "from": "bob@...", "subject": "PR review", "unread": false },
+  ...
+]
+
+$ casper gmail.read --id abc123
+{ "from": "alice@...", "subject": "Meeting tomorrow", "body": "Hi, can we..." }
+
+$ casper gmail.compose --to "alice@example.com" --subject "Re: Meeting" --body "Sure, 2pm works"
+{ "id": "xyz789", "status": "draft" }
+
+$ casper gmail.compose --to "alice@example.com" --subject "Re: Meeting" --body "Sure, 2pm works" --send
+{ "id": "xyz789", "status": "sent" }
+
+$ casper gmail.unread
+3
+```
+
+**MCP tool (what an LLM sees):**
+```json
+{
+  "tools": [
+    {
+      "name": "gmail.inbox",
+      "description": "List recent inbox messages",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "count": { "type": "number", "description": "Number of messages (default: 20)" }
+        }
+      }
+    },
+    {
+      "name": "gmail.read",
+      "description": "Read a specific email message",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "description": "Message ID" }
+        },
+        "required": ["id"]
+      }
+    },
+    {
+      "name": "gmail.compose",
+      "description": "Compose and optionally send an email",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "to": { "type": "string", "description": "Recipient email address" },
+          "subject": { "type": "string", "description": "Email subject" },
+          "body": { "type": "string", "description": "Email body text" },
+          "send": { "type": "boolean", "description": "Send immediately (default: false, saves as draft)" }
+        },
+        "required": ["to", "subject", "body"]
+      }
+    },
+    {
+      "name": "gmail.reply",
+      "description": "Reply to an email message",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "description": "Message ID to reply to" },
+          "body": { "type": "string", "description": "Reply text" },
+          "send": { "type": "boolean", "description": "Send immediately (default: false)" }
+        },
+        "required": ["id", "body"]
+      }
+    },
+    {
+      "name": "gmail.search",
+      "description": "Search Gmail messages",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string", "description": "Search query (Gmail syntax)" },
+          "count": { "type": "number", "description": "Max results (default: 10)" }
+        },
+        "required": ["query"]
+      }
+    },
+    {
+      "name": "gmail.unread",
+      "description": "Get the number of unread messages in inbox",
+      "inputSchema": { "type": "object", "properties": {} }
+    }
+  ]
+}
+```
+
+**Skill description (injected into agent context):**
+```markdown
+## Gmail
+
+### Available actions
+
+- **gmail.inbox**: List recent inbox messages
+  - `count`: Number of messages (default: 20)
+- **gmail.read**: Read a specific email message
+  - `id`: Message ID (required)
+- **gmail.compose**: Compose and optionally send an email
+  - `to`: Recipient email address (required)
+  - `subject`: Email subject (required)
+  - `body`: Email body text (required)
+  - `send`: Send immediately (default: false, saves as draft)
+- **gmail.reply**: Reply to an email message
+  - `id`: Message ID to reply to (required)
+  - `body`: Reply text (required)
+  - `send`: Send immediately (default: false)
+- **gmail.search**: Search Gmail messages
+  - `query`: Search query — uses Gmail syntax: from:, to:, subject:, has:attachment, etc. (required)
+  - `count`: Max results (default: 10)
+- **gmail.unread**: Get the number of unread messages in inbox
+
+### Tips for agents
+
+- Read before composing: always check inbox or search first to understand context
+- Draft by default: use `send: false` (the default) so the user can review
+- Gmail search syntax: `from:alice`, `is:unread`, `has:attachment`, `newer_than:2d`
+- Reply threading: use `gmail.reply` instead of `gmail.compose` to preserve threads
+```
+
+**Direct TypeScript:**
+```typescript
+import { inbox, readMessage, compose, reply, search } from "jsr:@peekaboo/casper/recipes/gmail";
+
+// Read recent mail
+const messages = await inbox.execute({ count: 5 });
+const unread = messages.filter(m => m.unread);
+
+// Read a specific message
+const msg = await readMessage.execute({ id: unread[0].id });
+console.log(`From: ${msg.from}\nSubject: ${msg.subject}\n\n${msg.body}`);
+
+// Draft a reply
+await reply.execute({
+  id: msg.id,
+  body: "Thanks, I'll review the PR this afternoon.",
+  send: false,  // Just draft it
+});
+
+// Search
+const fromAlice = await search.execute({ query: "from:alice has:attachment" });
+```
+
+### Why this design is better than the alternatives
+
+**vs. a dedicated Gmail MCP server** (e.g., `gmail-mcp-server` on npm):
+A standalone Gmail MCP server only gives you API access. If the user doesn't
+have OAuth configured, it's useless. Casper's multi-plane approach degrades
+gracefully — API > Apple Mail > browser UI — so something always works.
+
+**vs. OpenClaw's Gmail skill** (markdown instructing the LLM to use CLI):
+OpenClaw's skill tells the LLM "use `peekaboo click` on the Compose button."
+This breaks whenever Gmail changes its UI. Casper's recipe uses structured
+API calls when available, and only falls back to UI automation as a last
+resort. The recipe also returns structured data, not screenshots.
+
+**vs. Apple Mail AppleScript only:**
+Not everyone uses Apple Mail. The multi-plane approach works regardless of
+which mail client (or no client) the user has.
+
+### The plane fallback principle
+
+Gmail illustrates a general pattern for all Casper recipes:
+
+```
+1. Module plane (API)    — structured, fast, works headless
+   ↓ (no token / no API)
+2. Script plane          — semantic verbs, reliable for scriptable apps
+   ↓ (app not scriptable / not running)
+3. Native plane (AX/UI)  — always works if we have accessibility permission
+```
+
+Each step down the chain trades precision for universality. The recipe
+encapsulates this decision so the calling code (CLI, MCP, agent) never
+has to think about it.
+
+---
+
 ## File Layout (updated)
 
 ```
@@ -3757,9 +4831,12 @@ casper/
     │   ├── spotify.ts            # Spotify profile
     │   ├── safari.ts             # Safari profile
     │   ├── music.ts              # Music profile
-    │   └── chrome.ts             # Chrome profile (with CDP module config)
+    │   ├── chrome.ts             # Chrome profile (with CDP module config)
+    │   ├── gmail.ts              # Gmail profile (virtual — web app + Apple Mail)
+    │   └── apple-mail.ts         # Apple Mail profile (scriptable native client)
     ├── modules/                  # Third control plane — protocol-based channels
     │   ├── cdp.ts                # Chrome DevTools Protocol client (WebSocket)
+    │   ├── gmail-api.ts          # Gmail REST API client (OAuth token managed)
     │   ├── obsidian.ts           # Obsidian Local REST API
     │   ├── vscode.ts             # VS Code settings/extensions via filesystem
     │   ├── docker.ts             # Docker API via Unix domain socket
@@ -3769,7 +4846,8 @@ casper/
     │   ├── types.ts              # Recipe<TInput, TOutput> interface
     │   ├── mod.ts                # Recipe registry
     │   ├── spotify.ts            # Spotify recipes (play, nowPlaying, next, volume)
-    │   └── browser.ts            # Browser recipes (navigate, currentUrl — multi-plane)
+    │   ├── browser.ts            # Browser recipes (navigate, currentUrl — multi-plane)
+    │   └── gmail.ts              # Gmail recipes (inbox, read, compose, reply, search)
     ├── runtime/
     │   └── sandbox.ts            # Deno Worker sandbox for third-party recipes
     ├── cli/
